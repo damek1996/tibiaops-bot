@@ -20,24 +20,37 @@ const commands = [
   },
   {
     name: "settle",
-    description: "Guided post-hunt settlement (multi-paste)",
+    description: "Party hunt settlement + corrected loot (BUY vs NPC) + transfers",
     options: [
       {
         type: 1,
         name: "start",
         description: "Start a settlement session",
         options: [
-          { type: 3, name: "roles", description: "Comma-separated order, e.g. KNIGHT,RP,MS,ED", required: false },
           { type: 3, name: "world", description: "World (default Secura)", required: false }
         ]
       },
       {
         type: 1,
-        name: "paste",
-        description: "Paste one player's analyzer text",
+        name: "party",
+        description: "Paste Party Hunt Analyzer (players + supplies/balances)",
         options: [
-          { type: 3, name: "text", description: "Paste analyzer output (include Looted Items)", required: true }
+          { type: 3, name: "text", description: "Paste Party Hunt Analyzer output", required: true }
         ]
+      },
+      {
+        type: 1,
+        name: "looter",
+        description: "Paste one player's analyzer (Looted Items)",
+        options: [
+          { type: 3, name: "name", description: "Exact player name from party analyzer", required: true },
+          { type: 3, name: "text", description: "Paste player's analyzer output", required: true }
+        ]
+      },
+      {
+        type: 1,
+        name: "done",
+        description: "Calculate transfers + sell instructions now"
       }
     ]
   }
