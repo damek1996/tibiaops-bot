@@ -2,14 +2,13 @@
   "name": "tibiaops-bot",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
+  "main": "index.mjs",
   "scripts": {
-    "start": "node index.js",
-    "register": "node register-commands.js"
+    "start": "node index.mjs",
+    "register": "node register-commands.mjs"
   },
   "dependencies": {
     "discord.js": "^14.19.3",
-    "dotenv": "^16.4.5",
-    "node-fetch": "^3.3.2"
+    "dotenv": "^16.4.5"
   }
 }
