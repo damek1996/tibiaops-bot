@@ -1,4 +1,4 @@
-import "dotenv/config";
+﻿import "dotenv/config";
 import {
   Client,
   GatewayIntentBits,
@@ -53,19 +53,19 @@ client.on("interactionCreate", async interaction => {
         const result = await computeSettlementSecura(sess.players);
 
         const transfersText = result.transfers.length
-          ? result.transfers.map(t => `• **${t.from}** → **${t.to}**: **${fmt(t.amount)} gp**`).join("\n")
+          ? result.transfers.map(t => `â€˘ **${t.from}** â†’ **${t.to}**: **${fmt(t.amount)} gp**`).join("\n")
           : "No transfers needed.";
 
         const buyText = result.sellBuy.length
-          ? result.sellBuy.slice(0, 20).map(x => `• ${x.qty}x ${x.name} (BUY ${fmt(x.marketBuy ?? 0)} | NPC ${fmt(x.npcSell)})`).join("\n")
+          ? result.sellBuy.slice(0, 20).map(x => `â€˘ ${x.qty}x ${x.name} (BUY ${fmt(x.marketBuy ?? 0)} | NPC ${fmt(x.npcSell)})`).join("\n")
           : "None.";
 
         const npcText = result.sellNpc.length
-          ? result.sellNpc.slice(0, 20).map(x => `• ${x.qty}x ${x.name} (NPC ${fmt(x.npcSell)} | BUY ${fmt(x.marketBuy ?? 0)})`).join("\n")
+          ? result.sellNpc.slice(0, 20).map(x => `â€˘ ${x.qty}x ${x.name} (NPC ${fmt(x.npcSell)} | BUY ${fmt(x.marketBuy ?? 0)})`).join("\n")
           : "None.";
 
         const embed = new EmbedBuilder()
-          .setTitle("Hunt Settlement — Secura (BUY vs NPC)")
+          .setTitle("Hunt Settlement â€” Secura (BUY vs NPC)")
           .setDescription(`Updated: ${result.updatedAt.toISOString()}`)
           .addFields(
             {
@@ -77,8 +77,8 @@ client.on("interactionCreate", async interaction => {
                 `Share each (${sess.players.length}): **${fmt(result.share)} gp**`
             },
             { name: "Transfers", value: transfersText.slice(0, 1024) },
-            { name: `Loot holder: ${result.lootHolder} — SELL TO MARKET BUY`, value: buyText.slice(0, 1024) },
-            { name: `Loot holder: ${result.lootHolder} — SELL TO NPC`, value: npcText.slice(0, 1024) }
+            { name: `Loot holder: ${result.lootHolder} â€” SELL TO MARKET BUY`, value: buyText.slice(0, 1024) },
+            { name: `Loot holder: ${result.lootHolder} â€” SELL TO NPC`, value: npcText.slice(0, 1024) }
           );
 
         settleSessions.delete(interaction.channelId);
@@ -115,7 +115,7 @@ client.on("interactionCreate", async interaction => {
 
     return interaction.reply({
       content:
-        `**Secura — ${item}**\n` +
+        `**Secura â€” ${item}**\n` +
         `Buy: ${data.buy != null ? formatGold(data.buy) : "n/a"}\n` +
         `Sell: ${data.sell != null ? formatGold(data.sell) : "n/a"}\n` +
         `Updated: ${lastSnapshot.updatedAt?.toISOString?.() ?? "n/a"}`,

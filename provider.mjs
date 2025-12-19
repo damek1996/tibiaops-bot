@@ -1,4 +1,4 @@
-const BASE_URL = process.env.TIBIA_MARKET_BASE_URL || "https://api.tibiamarket.top";
+﻿const BASE_URL = process.env.TIBIA_MARKET_BASE_URL || "https://api.tibiamarket.top";
 
 export function normItemName(s) {
   return String(s ?? "").trim().toLowerCase();

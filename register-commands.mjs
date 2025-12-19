@@ -1,4 +1,4 @@
-import "dotenv/config";
+﻿import "dotenv/config";
 import { REST, Routes } from "discord.js";
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;

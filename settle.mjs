@@ -1,4 +1,4 @@
-import { fetchMarketSnapshotSecura, normItemName } from "./provider.mjs";
+﻿import { fetchMarketSnapshotSecura, normItemName } from "./provider.mjs";
 import { getItemIdByName, getNpcSellById } from "./provider.mjs";
 
 function parseIntComma(s) {
