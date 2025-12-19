@@ -6,21 +6,16 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
 
 if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error("Missing DISCORD_TOKEN, DISCORD_CLIENT_ID, or DISCORD_GUILD_ID in environment.");
+  console.error("Missing env: DISCORD_TOKEN / DISCORD_CLIENT_ID / DISCORD_GUILD_ID");
   process.exit(1);
 }
 
 const commands = [
   {
     name: "price",
-    description: "Get Secura market price for an item",
+    description: "Check Secura market price (BUY/SELL) for an item",
     options: [
-      {
-        type: 3,
-        name: "item",
-        description: "Item name, e.g. soulbleeder",
-        required: true
-      }
+      { type: 3, name: "item", description: "Item name, e.g. soulbleeder", required: true }
     ]
   },
   {
@@ -39,9 +34,9 @@ const commands = [
       {
         type: 1,
         name: "paste",
-        description: "Paste one player's analyzer text for the current role",
+        description: "Paste one player's analyzer text",
         options: [
-          { type: 3, name: "text", description: "Paste analyzer output (including Looted Items)", required: true }
+          { type: 3, name: "text", description: "Paste analyzer output (include Looted Items)", required: true }
         ]
       }
     ]
@@ -50,11 +45,6 @@ const commands = [
 
 const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
-try {
-  console.log("Registering slash commands...");
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log("Done.");
-} catch (e) {
-  console.error(e);
-  process.exit(1);
-}
+console.log("Registering slash commands...");
+await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+console.log("Done.");
