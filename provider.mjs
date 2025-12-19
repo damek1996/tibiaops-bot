@@ -22,9 +22,11 @@ async function fetchJson(url) {
 
 // -------------------- item metadata cache --------------------
 let metaLoaded = false;
-let nameToId = new Map();   // normalized name -> id
-let idToName = new Map();   // id -> normalized name
-let idToNpcSell = new Map();// id -> best npc sell price (max across npc list)
+let nameToId = new Map();    // normalized name -> id
+let idToName = new Map();    // id -> normalized name
+
+// IMPORTANT: npc_buy = NPC buys from player (player sells to NPC). This is the correct "sell to NPC" price.
+let idToNpcBuy = new Map();  // id -> best NPC BUY price (max across npc_buy list)
 
 async function loadMetadata() {
   if (metaLoaded) return;
@@ -41,14 +43,15 @@ async function loadMetadata() {
     nameToId.set(norm, id);
     idToName.set(id, norm);
 
-    let npcSell = 0;
-    if (Array.isArray(r.npc_sell) && r.npc_sell.length) {
-      for (const x of r.npc_sell) {
+    // npc_buy = NPC buys from you (you can sell to NPC) -> this is the relevant price for "sell to NPC"
+    let npcBuy = 0;
+    if (Array.isArray(r.npc_buy) && r.npc_buy.length) {
+      for (const x of r.npc_buy) {
         const p = Number(x?.price);
-        if (Number.isFinite(p) && p > npcSell) npcSell = p;
+        if (Number.isFinite(p) && p > npcBuy) npcBuy = p;
       }
     }
-    idToNpcSell.set(id, npcSell);
+    idToNpcBuy.set(id, npcBuy);
   }
 
   if (nameToId.size === 0) throw new Error("item_metadata: empty");
@@ -60,23 +63,22 @@ export async function getItemIdByName(name) {
   return nameToId.get(normItemName(name)) ?? null;
 }
 
-export async function getNpcSellById(id) {
+export async function getNpcBuyById(id) {
   await loadMetadata();
-  return idToNpcSell.get(id) ?? 0;
+  return idToNpcBuy.get(id) ?? 0;
 }
 
 // -------------------- market snapshot (Secura) --------------------
 export async function fetchMarketSnapshotSecura(itemNames = []) {
   await loadMetadata();
 
-  // Convert item names to ids
   const ids = [];
   for (const nm of itemNames) {
     const id = nameToId.get(normItemName(nm));
     if (typeof id === "number") ids.push(id);
   }
 
-  // Query only requested items (recommended for rate limit)
+  // Query only requested items to stay under rate limits
   const url =
     `${BASE_URL}/market_values?server=Secura` +
     (ids.length ? `&item_ids=${encodeURIComponent(ids.join(","))}` : `&limit=100`);
