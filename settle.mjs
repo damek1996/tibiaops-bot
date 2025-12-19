@@ -15,6 +15,7 @@ export function normalizeLootItemName(raw) {
   return s;
 }
 
+// Coins are fixed gold value
 function fixedCoinValue(nameNorm) {
   if (nameNorm === "gold coin" || nameNorm === "gold coins") return 1;
   if (nameNorm === "platinum coin" || nameNorm === "platinum coins") return 100;
@@ -42,85 +43,93 @@ async function resolveItemId(nameNorm) {
   return null;
 }
 
+function isDefinitelyNotPlayerName(t) {
+  const s = t.trim();
+  if (!s) return true;
+  if (s.includes(":")) return true;
+  if (/^Session data/i.test(s)) return true;
+  if (/^Session:/i.test(s)) return true;
+  if (/^Loot Type/i.test(s)) return true;
+  if (/^Looted Items/i.test(s)) return true;
+  if (/^Killed Monsters/i.test(s)) return true;
+  if (/^Damage/i.test(s)) return true;
+  if (/^Healing/i.test(s)) return true;
+  if (/^(Market|NPC|Custom)$/i.test(s)) return true;
+  if (/^\d+$/i.test(s)) return true;
+  return false;
+}
+
 /**
- * Party Hunt Analyzer parser (STRICT):
- * - Only accept a player header line if within the next few lines we see "Supplies:" (and usually Loot/Balance).
- * - Explicitly reject headings like "Loot Type: Market" so "Market" is never treated as a player.
+ * Party parser:
+ * - Multiline strict block parsing
+ * - Safe single-line fallback (requires the full "Loot: ... Supplies: ... Balance: ..." triple)
  */
 export function parsePartyAnalyzerText(text) {
-  const whole = String(text ?? "").replace(/\r\n/g, "\n");
-  const linesRaw = whole.split("\n").map(l => l.replace(/\t/g, "    "));
+  const raw = String(text ?? "");
 
-  // Helper to detect headings/non-player lines
-  function isDefinitelyNotPlayerName(t) {
-    const s = t.trim();
-    if (!s) return true;
-    if (s.includes(":")) return true; // headings with colon
-    if (/^Session data/i.test(s)) return true;
-    if (/^Session:/i.test(s)) return true;
-    if (/^Loot Type/i.test(s)) return true;
-    if (/^Killed Monsters/i.test(s)) return true;
-    if (/^Looted Items/i.test(s)) return true;
-    if (/^Damage/i.test(s)) return true;
-    if (/^Healing/i.test(s)) return true;
+  // ---------- multiline pass ----------
+  const whole = raw.replace(/\r\n/g, "\n");
+  const lines = whole.split("\n").map(l => l.replace(/\t/g, "    "));
 
-    // VERY IMPORTANT: block the common Loot Type value words
-    if (/^(Market|NPC|Custom)$/i.test(s)) return true;
-
-    // If the "name" is basically a number, reject
-    if (/^\d+$/i.test(s)) return true;
-
-    return false;
-  }
-
-  // Find player blocks by scanning for header lines and validating they have Supplies below
   const players = [];
-  for (let i = 0; i < linesRaw.length; i++) {
-    const line = linesRaw[i].trimEnd();
-    const t = line.trim();
+  for (let i = 0; i < lines.length; i++) {
+    const header = lines[i].trim();
+    if (isDefinitelyNotPlayerName(header)) continue;
 
-    if (isDefinitelyNotPlayerName(t)) continue;
-
-    const isLeader = /\(Leader\)/i.test(t);
-    const name = t.replace(/\(Leader\)/i, "").trim();
+    const isLeader = /\(Leader\)/i.test(header);
+    const name = header.replace(/\(Leader\)/i, "").trim();
     if (!name) continue;
 
-    // Validate: within the next 6 lines, do we see "Supplies:"?
-    let supplies = null;
-    let loot = null;
-    let balance = null;
+    // look ahead for stats
+    let supplies = null, loot = null, balance = null;
 
-    for (let j = i + 1; j < Math.min(i + 7, linesRaw.length); j++) {
-      const tj = linesRaw[j].trim();
-
-      const mSup = tj.match(/^Supplies:\s*([-\d,]+)/i);
+    for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+      const t = lines[j].trim();
+      const mSup = t.match(/^Supplies:\s*([-\d,]+)/i);
       if (mSup) supplies = parseIntComma(mSup[1]);
 
-      const mLoot = tj.match(/^Loot:\s*([-\d,]+)/i);
+      const mLoot = t.match(/^Loot:\s*([-\d,]+)/i);
       if (mLoot) loot = parseIntComma(mLoot[1]);
 
-      const mBal = tj.match(/^Balance:\s*([-\d,]+)/i);
+      const mBal = t.match(/^Balance:\s*([-\d,]+)/i);
       if (mBal) balance = parseIntComma(mBal[1]);
 
-      // If we hit another header candidate before supplies, stop early
-      if (j > i + 1 && !tj.includes(":") && !isDefinitelyNotPlayerName(tj)) {
-        // another possible player name line
-        break;
-      }
+      // stop if another header begins
+      if (j > i + 1 && !t.includes(":") && !isDefinitelyNotPlayerName(t)) break;
     }
 
-    // Accept only if supplies exists (this is required for corrected settlement)
     if (Number.isFinite(supplies)) {
       players.push({ name, isLeader, supplies, loot, balance });
     }
   }
 
-  return { players };
+  if (players.length) return { players };
+
+  // ---------- safe single-line fallback ----------
+  const flat = raw.replace(/\s+/g, " ").trim();
+
+  // Capture blocks that clearly contain Loot + Supplies + Balance after a name.
+  // This will not treat "Market" as a name because it never precedes those triples as a block owner.
+  const re = /([A-Za-z0-9'._ -]+?)(\s*\(Leader\))?\s+Loot:\s*([-\d,]+)\s+Supplies:\s*([-\d,]+)\s+Balance:\s*([-\d,]+)/gi;
+
+  const out = [];
+  let m;
+  while ((m = re.exec(flat)) !== null) {
+    const name = String(m[1] ?? "").trim();
+    if (!name || isDefinitelyNotPlayerName(name)) continue;
+
+    out.push({
+      name,
+      isLeader: !!m[2],
+      loot: parseIntComma(m[3]),
+      supplies: parseIntComma(m[4]),
+      balance: parseIntComma(m[5])
+    });
+  }
+
+  return { players: out.filter(p => Number.isFinite(p.supplies)) };
 }
 
-/**
- * Looter analyzer parser: extracts Looted Items.
- */
 export function parseLooterAnalyzerText(text) {
   const whole = String(text ?? "");
   const items = [];
@@ -135,7 +144,6 @@ export function parseLooterAnalyzerText(text) {
 
       const m = trimmed.match(/^(\d+)\s*x\s+(.+)$/i);
       if (!m) continue;
-
       const qty = Number(m[1]);
       if (!Number.isFinite(qty) || qty <= 0) continue;
 
@@ -159,14 +167,6 @@ export function parseLooterAnalyzerText(text) {
   return { items };
 }
 
-/**
- * Corrected settlement:
- * - Best liquidation per item: max(Market BUY, NPC BUY)
- * - Repays supplies and splits profit equally
- * - Produces direct payers->receivers transfers (no cash holder)
- *
- * Requires: every party member pastes a looter analyzer (even if "Looted Items: None")
- */
 export async function computeCorrectedSettlementSecura({ party, lootersByName }) {
   if (!party?.players?.length) throw new Error("Party analyzer missing or no players parsed.");
 
@@ -180,14 +180,11 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
   if (n <= 0) throw new Error("No players in party.");
 
   const missing = [];
-  for (const p of roster) {
-    if (!lootersByName.has(p.name)) missing.push(p.name);
-  }
+  for (const p of roster) if (!lootersByName.has(p.name)) missing.push(p.name);
   if (missing.length) {
     throw new Error(`Missing looter paste for: ${missing.join(", ")} (paste even if 'Looted Items: None')`);
   }
 
-  // Unique item names
   const uniqueNames = new Set();
   for (const p of roster) {
     const items = lootersByName.get(p.name) ?? [];
@@ -197,7 +194,6 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
   const snap = await fetchMarketSnapshotSecura(itemNames);
 
-  // nameNorm -> decision {unit, route, npcBuy, marketBuy}
   const itemDecision = new Map();
   const unmatchedItemNames = [];
 
@@ -214,17 +210,15 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
       continue;
     }
 
-    const npcBuy = await getNpcBuyById(id); // SELL TO NPC price
-    const marketBuy = snap.items.get(nm)?.buy ?? null;
+    const npcBuy = await getNpcBuyById(id);              // SELL TO NPC price
+    const marketBuy = snap.items.get(nm)?.buy ?? null;   // Market BUY offer
     const buyVal = marketBuy != null ? marketBuy : 0;
 
     const unit = Math.max(buyVal, npcBuy);
     const route = buyVal > npcBuy ? "BUY" : "NPC";
-
     itemDecision.set(nm, { unit, route, npcBuy, marketBuy });
   }
 
-  // Per-player held loot value + instructions
   const perPlayer = [];
   let totalSupplies = 0;
   let totalHeldLoot = 0;
@@ -253,14 +247,7 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
       heldLootValue += qty * dec.unit;
 
-      const row = {
-        name: nameNorm,
-        qty,
-        npcBuy: dec.npcBuy,
-        marketBuy: dec.marketBuy,
-        total: qty * dec.unit
-      };
-
+      const row = { name: nameNorm, qty, npcBuy: dec.npcBuy, marketBuy: dec.marketBuy, total: qty * dec.unit };
       if (dec.route === "BUY") sellBuy.push(row);
       else if (dec.route === "NPC") sellNpc.push(row);
     }

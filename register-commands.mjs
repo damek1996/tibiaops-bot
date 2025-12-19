@@ -15,42 +15,66 @@ const commands = [
     name: "price",
     description: "Check Secura market price (BUY/SELL) for an item",
     options: [
-      { type: 3, name: "item", description: "Item name, e.g. soulbleeder", required: true }
+      { type: 3, name: "item", description: "Item name", required: true, max_length: 100 }
     ]
   },
   {
     name: "settle",
-    description: "Party hunt settlement + corrected loot (BUY vs NPC) + transfers",
+    description: "Corrected loot (BUY vs NPC BUY) + equal split + direct transfers",
     options: [
       {
         type: 1,
         name: "start",
         description: "Start a settlement session",
         options: [
-          { type: 3, name: "world", description: "World (default Secura)", required: false }
+          { type: 3, name: "world", description: "World (default Secura)", required: false, max_length: 50 }
         ]
       },
       {
         type: 1,
         name: "party",
-        description: "Paste Party Hunt Analyzer (players + supplies/balances)",
+        description: "Provide Party Hunt Analyzer (text OR attachment .txt)",
         options: [
-          { type: 3, name: "text", description: "Paste Party Hunt Analyzer output", required: true }
+          {
+            type: 3,
+            name: "text",
+            description: "Paste Party Hunt Analyzer (short) OR leave empty and attach a .txt",
+            required: false,
+            max_length: 6000
+          },
+          {
+            type: 11,
+            name: "file",
+            description: "Attach a .txt file with Party Hunt Analyzer (recommended)",
+            required: false
+          }
         ]
       },
       {
         type: 1,
         name: "looter",
-        description: "Paste one player's analyzer (Looted Items)",
+        description: "Provide player's analyzer with Looted Items (text OR attachment .txt)",
         options: [
-          { type: 3, name: "name", description: "Exact player name from party analyzer", required: true },
-          { type: 3, name: "text", description: "Paste player's analyzer output", required: true }
+          { type: 3, name: "name", description: "Exact player name from party analyzer", required: true, max_length: 100 },
+          {
+            type: 3,
+            name: "text",
+            description: "Paste player analyzer (short) OR leave empty and attach a .txt",
+            required: false,
+            max_length: 6000
+          },
+          {
+            type: 11,
+            name: "file",
+            description: "Attach a .txt file with player analyzer (recommended)",
+            required: false
+          }
         ]
       },
       {
         type: 1,
         name: "done",
-        description: "Calculate transfers + sell instructions now"
+        description: "Compute transfers + sell routes now"
       }
     ]
   }
