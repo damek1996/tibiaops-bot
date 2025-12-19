@@ -1,5 +1,5 @@
-import { fetchMarketSnapshotSecura, normItemName } from "./provider.js";
-import { getItemIdByName, getNpcSellById } from "./provider.js";
+import { fetchMarketSnapshotSecura, normItemName } from "./provider.mjs";
+import { getItemIdByName, getNpcSellById } from "./provider.mjs";
 
 function parseIntComma(s) {
   if (!s) return 0;
@@ -37,38 +37,58 @@ export function parseAnalyzerText(text) {
   let supplies = null;
   let balance = null;
 
-  for (const line of lines) {
-    const mLoot = line.match(/^Loot:\s*([-\d,]+)/i);
-    if (mLoot) loot = parseIntComma(mLoot[1]);
+// Works even if Discord collapses everything into one line
+const whole = String(text);
 
-    const mSup = line.match(/^Supplies:\s*([-\d,]+)/i);
-    if (mSup) supplies = parseIntComma(mSup[1]);
+// Match fields anywhere, not only at line-start
+const mLootAny = whole.match(/(?:^|\s)Loot:\s*([-\d,]+)/i);
+if (mLootAny) loot = parseIntComma(mLootAny[1]);
 
-    const mBal = line.match(/^Balance:\s*([-\d,]+)/i);
-    if (mBal) balance = parseIntComma(mBal[1]);
-  }
+const mSupAny = whole.match(/(?:^|\s)Supplies:\s*([-\d,]+)/i);
+if (mSupAny) supplies = parseIntComma(mSupAny[1]);
+
+const mBalAny = whole.match(/(?:^|\s)Balance:\s*([-\d,]+)/i);
+if (mBalAny) balance = parseIntComma(mBalAny[1]);
+
 
   const items = [];
-  const idx = lines.findIndex(l => /^Looted Items:/i.test(l.trim()));
-  if (idx >= 0) {
-    for (let i = idx + 1; i < lines.length; i++) {
-      const trimmed = lines[i].trim();
-      if (!trimmed) continue;
-      if (/^none/i.test(trimmed)) continue;
 
-      const m = trimmed.match(/^(\d+)\s*x\s+(.+)$/i);
-      if (!m) continue;
+// Try normal multiline first
+let idx = lines.findIndex(l => /^Looted Items:/i.test(l.trim()));
+if (idx >= 0) {
+  for (let i = idx + 1; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+    if (/^none/i.test(trimmed)) continue;
 
-      const qty = Number(m[1]);
-      if (!Number.isFinite(qty) || qty <= 0) continue;
+    const m = trimmed.match(/^(\d+)\s*x\s+(.+)$/i);
+    if (!m) continue;
 
-      const name = normalizeLootItemName(m[2]);
-      items.push({ name, qty });
+    const qty = Number(m[1]);
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+
+    const name = normalizeLootItemName(m[2]);
+    items.push({ name, qty });
+  }
+} else {
+  // Fallback: single-line paste (items appear after "Looted Items:")
+  const mBlock = whole.match(/Looted Items:\s*(.+)$/i);
+  if (mBlock) {
+    const tail = mBlock[1];
+
+    // Extract repeated patterns like "9x a gold coin" "3x cheese"
+    const re = /(\d+)\s*x\s+([^0-9]+?)(?=(\s+\d+\s*x\s+)|$)/gi;
+    let mm;
+    while ((mm = re.exec(tail)) !== null) {
+      const qty = Number(mm[1]);
+      const nameRaw = (mm[2] ?? "").trim();
+      if (!qty || !nameRaw) continue;
+      items.push({ name: normalizeLootItemName(nameRaw), qty });
     }
   }
-
-  return { loot, supplies, balance, items };
 }
+
+return { loot, supplies, balance, items };
 
 async function resolveItemId(nameNorm) {
   for (const cand of candidateNames(nameNorm)) {

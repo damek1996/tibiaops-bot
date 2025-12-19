@@ -8,8 +8,8 @@ import {
   EmbedBuilder
 } from "discord.js";
 
-import { fetchMarketSnapshotSecura, normItemName, formatGold } from "./provider.js";
-import { parseAnalyzerText, computeSettlementSecura } from "./settle.js";
+import { fetchMarketSnapshotSecura, normItemName, formatGold } from "./provider.mjs";
+import { parseAnalyzerText, computeSettlementSecura } from "./settle.mjs";
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]
