@@ -2,10 +2,10 @@
 import { getItemIdByName, getNpcSellById } from "./provider.mjs";
 
 function parseIntComma(s) {
-  if (!s) return 0;
+  if (!s) return null;
   const cleaned = String(s).replace(/,/g, "").trim();
   const n = Number(cleaned);
-  return Number.isFinite(n) ? Math.trunc(n) : 0;
+  return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
 export function normalizeLootItemName(raw) {
@@ -15,37 +15,93 @@ export function normalizeLootItemName(raw) {
   return s;
 }
 
+// Fixed coin values (prevents any nonsense pricing)
+function fixedCoinValue(nameNorm) {
+  if (nameNorm === "gold coin" || nameNorm === "gold coins") return 1;
+  if (nameNorm === "platinum coin" || nameNorm === "platinum coins") return 100;
+  if (nameNorm === "crystal coin" || nameNorm === "crystal coins") return 10000;
+  return null;
+}
+
 function candidateNames(norm) {
   const out = [norm];
-
   if (norm.endsWith("coins")) out.push(norm.replace(/coins$/, "coin"));
   if (norm.endsWith("ies")) out.push(norm.slice(0, -3) + "y");
   if (norm.endsWith("es")) out.push(norm.slice(0, -2));
   if (norm.endsWith("s")) out.push(norm.slice(0, -1));
-
   if (norm === "gold coins") out.push("gold coin");
   if (norm === "platinum coins") out.push("platinum coin");
   if (norm === "crystal coins") out.push("crystal coin");
-
   return [...new Set(out)].filter(Boolean);
 }
 
-export function parseAnalyzerText(text) {
+async function resolveItemId(nameNorm) {
+  for (const cand of candidateNames(nameNorm)) {
+    const id = await getItemIdByName(cand);
+    if (typeof id === "number") return id;
+  }
+  return null;
+}
+
+/**
+ * Party Hunt Analyzer:
+ * We only need player list + Supplies per player (+ optional Balance/Loot).
+ */
+export function parsePartyAnalyzerText(text) {
+  const whole = String(text).replace(/\r\n/g, "\n");
+  const lines = whole.split("\n").map(l => l.replace(/\t/g, "  "));
+
+  const players = [];
+  let current = null;
+
+  for (const rawLine of lines) {
+    const lineTrimEnd = rawLine.trimEnd();
+    const line = lineTrimEnd.trim();
+
+    // Heuristic: player header lines don't contain ":" and aren't session headings
+    if (
+      line &&
+      !line.includes(":") &&
+      !/^Session data/i.test(line) &&
+      !/^Session:/i.test(line) &&
+      !/^Loot Type:/i.test(line) &&
+      !/^Killed Monsters/i.test(line) &&
+      !/^Looted Items/i.test(line) &&
+      !/^Damage/i.test(line) &&
+      !/^Healing/i.test(line)
+    ) {
+      const isLeader = /\(Leader\)/i.test(line);
+      const name = line.replace(/\(Leader\)/i, "").trim();
+      current = { name, isLeader, supplies: null, loot: null, balance: null };
+      players.push(current);
+      continue;
+    }
+
+    if (!current) continue;
+
+    const mSup = line.match(/^Supplies:\s*([-\d,]+)/i);
+    if (mSup) current.supplies = parseIntComma(mSup[1]);
+
+    const mLoot = line.match(/^Loot:\s*([-\d,]+)/i);
+    if (mLoot) current.loot = parseIntComma(mLoot[1]);
+
+    const mBal = line.match(/^Balance:\s*([-\d,]+)/i);
+    if (mBal) current.balance = parseIntComma(mBal[1]);
+  }
+
+  const valid = players.filter(p => Number.isFinite(p.supplies));
+  return { players: valid };
+}
+
+/**
+ * Looter analyzer parse: extracts Looted Items.
+ * Works for multiline and single-line pastes.
+ */
+export function parseLooterAnalyzerText(text) {
   const whole = String(text);
-
-  // Match fields anywhere (works even if Discord collapses to one line)
-  const mLootAny = whole.match(/(?:^|\s)Loot:\s*([-\d,]+)/i);
-  const mSupAny = whole.match(/(?:^|\s)Supplies:\s*([-\d,]+)/i);
-  const mBalAny = whole.match(/(?:^|\s)Balance:\s*([-\d,]+)/i);
-
-  const loot = mLootAny ? parseIntComma(mLootAny[1]) : null;
-  const supplies = mSupAny ? parseIntComma(mSupAny[1]) : null;
-  const balance = mBalAny ? parseIntComma(mBalAny[1]) : null;
-
   const items = [];
   const lines = whole.replace(/\r\n/g, "\n").split("\n");
 
-  // Try multiline "Looted Items:"
   let idx = lines.findIndex(l => /^Looted Items:/i.test(l.trim()));
   if (idx >= 0) {
     for (let i = idx + 1; i < lines.length; i++) {
@@ -62,7 +118,6 @@ export function parseAnalyzerText(text) {
       items.push({ name: normalizeLootItemName(m[2]), qty });
     }
   } else {
-    // Fallback: single-line after "Looted Items:"
     const mBlock = whole.match(/Looted Items:\s*(.+)$/i);
     if (mBlock) {
       const tail = mBlock[1];
@@ -77,99 +132,160 @@ export function parseAnalyzerText(text) {
     }
   }
 
-  return { loot, supplies, balance, items };
+  return { items };
 }
 
-async function resolveItemId(nameNorm) {
-  for (const cand of candidateNames(nameNorm)) {
-    const id = await getItemIdByName(cand);
-    if (typeof id === "number") return id;
+/**
+ * Main engine: no cash holder.
+ *
+ * - supplies_i comes from party analyzer
+ * - heldLootValue_i comes from each player's looted items paste (best liquidation BUY vs NPC)
+ * - correctedNet = sum(heldLootValue_i) - sum(supplies_i)
+ * - share = floor(correctedNet / N)
+ * - fairPayout_i = supplies_i + share
+ * - delta_i = heldLootValue_i - fairPayout_i
+ *   delta > 0 => player pays out
+ *   delta < 0 => player receives
+ *
+ * Transfers generated by matching payers -> receivers.
+ */
+export async function computeCorrectedSettlementSecura({ party, lootersByName }) {
+  if (!party?.players?.length) throw new Error("Party analyzer missing or no players parsed.");
+
+  // Build roster with supplies
+  const roster = party.players.map(p => ({
+    name: p.name,
+    isLeader: !!p.isLeader,
+    supplies: p.supplies ?? 0
+  }));
+
+  const n = roster.length;
+  if (n <= 0) throw new Error("No players in party.");
+
+  // Ensure every player has a looter entry (even empty), otherwise totals will be incomplete
+  const missing = [];
+  for (const p of roster) {
+    if (!lootersByName.has(p.name)) missing.push(p.name);
   }
-  return null;
-}
+  if (missing.length) {
+    throw new Error(`Missing looter paste for: ${missing.join(", ")} (paste even if 'Looted Items: None')`);
+  }
 
-export async function computeSettlementSecura(players) {
-  // Collect unique item names across all players
-  const unique = new Set();
-  for (const p of players) for (const it of (p.items ?? [])) unique.add(normItemName(it.name));
-  const itemNames = [...unique];
+  // Aggregate each player's held items and global unique item names
+  const uniqueNames = new Set();
+  for (const p of roster) {
+    const items = lootersByName.get(p.name) ?? [];
+    for (const it of items) uniqueNames.add(normItemName(it.name));
+  }
+  const itemNames = [...uniqueNames];
 
-  // Fetch market BUY offers for those items (Secura)
+  // Market snapshot for BUY prices (Secura)
   const snap = await fetchMarketSnapshotSecura(itemNames);
 
-  // Build per-item liquidation decision (BUY vs NPC)
-  const itemMeta = new Map(); // nm -> { npcSell, marketBuy, unit, route }
+  // Precompute per-item best liquidation price + route
+  const itemDecision = new Map(); // nameNorm -> {unit, route, npcSell, marketBuy}
+  const unmatchedItems = [];
+
   for (const nm of itemNames) {
-    const id = await resolveItemId(nm);
-    const npcSell = id != null ? await getNpcSellById(id) : 0;
-    const marketBuy = snap.items.get(nm)?.buy ?? null;
-
-    const buyVal = marketBuy != null ? marketBuy : 0;
-    const unit = Math.max(buyVal, npcSell);
-    const route = buyVal > npcSell ? "SELL_TO_MARKET_BUY" : "SELL_TO_NPC";
-
-    itemMeta.set(nm, { npcSell, marketBuy, unit, route });
-  }
-
-  // Compute player loot values and net
-  const perPlayer = [];
-  let totalSupplies = 0;
-  let totalLootValue = 0;
-
-  for (const p of players) {
-    const items = p.items ?? [];
-    let lootValue = 0;
-
-    for (const it of items) {
-      const key = normItemName(it.name);
-      const meta = itemMeta.get(key);
-      if (!meta) continue;
-      lootValue += (it.qty || 0) * meta.unit;
+    // coin override
+    const coin = fixedCoinValue(nm);
+    if (coin != null) {
+      itemDecision.set(nm, { unit: coin, route: "COIN", npcSell: coin, marketBuy: coin });
+      continue;
     }
 
-    const supplies = Number.isFinite(p.supplies) ? p.supplies : 0;
-    const net = lootValue - supplies;
+    const id = await resolveItemId(nm);
+    if (id == null) {
+      unmatchedItems.push(nm);
+      continue;
+    }
 
-    totalSupplies += supplies;
-    totalLootValue += lootValue;
+    const npcSell = await getNpcSellById(id);
+    const marketBuy = snap.items.get(nm)?.buy ?? null;
+    const buyVal = marketBuy != null ? marketBuy : 0;
+
+    const unit = Math.max(buyVal, npcSell);
+    const route = buyVal > npcSell ? "BUY" : "NPC";
+
+    itemDecision.set(nm, { unit, route, npcSell, marketBuy });
+  }
+
+  // Compute heldLootValue per player + sell instructions per player
+  const perPlayer = [];
+  let totalSupplies = 0;
+  let totalHeldLoot = 0;
+
+  const sellInstructionsByPlayer = new Map(); // name -> {sellBuy[], sellNpc[], unmatched[]}
+
+  for (const p of roster) {
+    const items = lootersByName.get(p.name) ?? [];
+    const byNameQty = new Map();
+    for (const it of items) {
+      const k = normItemName(it.name);
+      byNameQty.set(k, (byNameQty.get(k) || 0) + (it.qty || 0));
+    }
+
+    let heldLootValue = 0;
+    const sellBuy = [];
+    const sellNpc = [];
+    const unmatched = [];
+
+    for (const [nameNorm, qty] of byNameQty.entries()) {
+      const dec = itemDecision.get(nameNorm);
+      if (!dec) {
+        unmatched.push({ name: nameNorm, qty });
+        continue;
+      }
+
+      heldLootValue += qty * dec.unit;
+
+      const row = {
+        name: nameNorm,
+        qty,
+        npcSell: dec.npcSell,
+        marketBuy: dec.marketBuy,
+        total: qty * dec.unit
+      };
+      if (dec.route === "BUY") sellBuy.push(row);
+      else if (dec.route === "NPC") sellNpc.push(row);
+      // COIN route: do not instruct sell; it's already gold
+    }
+
+    sellBuy.sort((a, b) => b.total - a.total);
+    sellNpc.sort((a, b) => b.total - a.total);
+
+    sellInstructionsByPlayer.set(p.name, { sellBuy, sellNpc, unmatched });
+
+    totalSupplies += p.supplies;
+    totalHeldLoot += heldLootValue;
 
     perPlayer.push({
-      role: p.role,
-      discordName: p.discordName,
-      lootValue,
-      supplies,
-      net,
-      lootReported: Number.isFinite(p.loot) ? p.loot : null,
-      items
+      name: p.name,
+      supplies: p.supplies,
+      heldLootValue
     });
   }
 
-  const n = perPlayer.length || 1;
-  const totalNet = totalLootValue - totalSupplies;
-  const share = Math.floor(totalNet / n);
+  const correctedNet = totalHeldLoot - totalSupplies;
+  const share = Math.floor(correctedNet / n);
 
-  // Pick loot holder (highest Loot if present, else highest computed lootValue)
-  let lootHolder = perPlayer[0];
-  for (const p of perPlayer) {
-    if (p.lootReported != null && lootHolder.lootReported != null) {
-      if (p.lootReported > lootHolder.lootReported) lootHolder = p;
-    } else if (p.lootReported != null && lootHolder.lootReported == null) {
-      lootHolder = p;
-    } else if (p.lootReported == null && lootHolder.lootReported == null) {
-      if (p.lootValue > lootHolder.lootValue) lootHolder = p;
-    }
-  }
-
-  // Compute transfers: payers (net > share) send to receivers (net < share)
+  // Fair payout from loot pot for each player = supplies repaid + equal share
+  // Compute deltas: held - payout
   const payers = [];
   const receivers = [];
 
   for (const p of perPlayer) {
-    const delta = p.net - share;
-    if (delta > 0) payers.push({ name: p.discordName, amt: delta });
-    if (delta < 0) receivers.push({ name: p.discordName, amt: -delta });
+    const fairPayout = p.supplies + share;
+    const delta = p.heldLootValue - fairPayout;
+
+    p.fairPayout = fairPayout;
+    p.delta = delta;
+
+    if (delta > 0) payers.push({ name: p.name, amt: delta });
+    if (delta < 0) receivers.push({ name: p.name, amt: -delta });
   }
 
+  // Transfers: match payers to receivers
   const transfers = [];
   let i = 0, j = 0;
   while (i < payers.length && j < receivers.length) {
@@ -181,50 +297,19 @@ export async function computeSettlementSecura(players) {
 
     pay.amt -= x;
     rec.amt -= x;
-
     if (pay.amt === 0) i++;
     if (rec.amt === 0) j++;
   }
 
-  // Sell instructions for loot holder
-  const lhCounts = new Map();
-  for (const it of (lootHolder.items ?? [])) {
-    const key = normItemName(it.name);
-    lhCounts.set(key, (lhCounts.get(key) || 0) + (it.qty || 0));
-  }
-
-  const sellNpc = [];
-  const sellBuy = [];
-
-  for (const [key, qty] of lhCounts.entries()) {
-    const meta = itemMeta.get(key);
-    if (!meta) continue;
-
-    const row = {
-      name: key,
-      qty,
-      npcSell: meta.npcSell,
-      marketBuy: meta.marketBuy,
-      total: qty * meta.unit
-    };
-
-    if (meta.route === "SELL_TO_MARKET_BUY") sellBuy.push(row);
-    else sellNpc.push(row);
-  }
-
-  sellNpc.sort((a, b) => b.total - a.total);
-  sellBuy.sort((a, b) => b.total - a.total);
-
   return {
     updatedAt: snap.updatedAt,
+    totalHeldLoot,
     totalSupplies,
-    totalLootValue,
-    totalNet,
+    correctedNet,
     share,
     perPlayer,
     transfers,
-    lootHolder: lootHolder?.discordName ?? "Unknown",
-    sellNpc,
-    sellBuy
+    sellInstructionsByPlayer,
+    unmatchedItemNames: [...new Set(unmatchedItems)]
   };
 }
