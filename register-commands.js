@@ -24,35 +24,6 @@ const commands = [
     ]
   },
   {
-    name: "alert",
-    description: "Price alerts",
-    options: [
-      {
-        type: 1,
-        name: "add",
-        description: "Add an alert",
-        options: [
-          { type: 3, name: "item", description: "Item name", required: true },
-          { type: 3, name: "type", description: "buy or sell", required: true, choices: [{ name: "buy", value: "buy" }, { name: "sell", value: "sell" }] },
-          { type: 3, name: "direction", description: "above or below", required: true, choices: [{ name: "above", value: "above" }, { name: "below", value: "below" }] },
-          { type: 3, name: "price", description: "e.g. 140kk, 120k, 100000", required: true },
-          { type: 5, name: "send_to_channel", description: "Send alert to channel instead of DM", required: false }
-        ]
-      },
-      {
-        type: 1,
-        name: "list",
-        description: "List your alerts"
-      },
-      {
-        type: 1,
-        name: "remove",
-        description: "Remove an alert",
-        options: [{ type: 4, name: "id", description: "Alert ID", required: true }]
-      }
-    ]
-  },
-  {
     name: "settle",
     description: "Guided post-hunt settlement (multi-paste)",
     options: [

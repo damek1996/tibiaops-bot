@@ -10,11 +10,7 @@ function parseIntComma(s) {
 
 export function normalizeLootItemName(raw) {
   let s = String(raw).trim().toLowerCase();
-
-  // strip articles
   s = s.replace(/^(a|an)\s+/, "");
-
-  // normalize plurals lightly (we also try candidates)
   s = s.replace(/\s+/g, " ").trim();
   return s;
 }
@@ -22,13 +18,11 @@ export function normalizeLootItemName(raw) {
 function candidateNames(norm) {
   const out = [norm];
 
-  // plurals
   if (norm.endsWith("coins")) out.push(norm.replace(/coins$/, "coin"));
   if (norm.endsWith("ies")) out.push(norm.slice(0, -3) + "y");
   if (norm.endsWith("es")) out.push(norm.slice(0, -2));
   if (norm.endsWith("s")) out.push(norm.slice(0, -1));
 
-  // common tibia
   if (norm === "gold coins") out.push("gold coin");
   if (norm === "platinum coins") out.push("platinum coin");
   if (norm === "crystal coins") out.push("crystal coin");
@@ -85,15 +79,12 @@ async function resolveItemId(nameNorm) {
 }
 
 export async function computeSettlementSecura(players) {
-  // Unique names
   const unique = new Set();
   for (const p of players) for (const it of p.items) unique.add(normItemName(it.name));
   const itemNames = [...unique];
 
-  // Market (BUY offers) for those names
   const snap = await fetchMarketSnapshotSecura(itemNames);
 
-  // Meta for each item name norm
   const itemMeta = new Map(); // nm -> { npcSell, marketBuy, unit, route }
   for (const nm of itemNames) {
     const { id } = await resolveItemId(nm);
@@ -107,7 +98,6 @@ export async function computeSettlementSecura(players) {
     itemMeta.set(nm, { npcSell, marketBuy, unit, route });
   }
 
-  // Player totals
   const perPlayer = [];
   let totalSupplies = 0;
   let totalLootValue = 0;
@@ -142,7 +132,6 @@ export async function computeSettlementSecura(players) {
   const totalNet = totalLootValue - totalSupplies;
   const share = Math.floor(totalNet / n);
 
-  // Loot holder: highest lootReported if present, else highest lootValue
   let lootHolder = perPlayer[0];
   for (const p of perPlayer) {
     if (p.lootReported != null && lootHolder.lootReported != null) {
@@ -154,7 +143,6 @@ export async function computeSettlementSecura(players) {
     }
   }
 
-  // Transfers (payers -> receivers)
   const payers = [];
   const receivers = [];
   for (const p of perPlayer) {
@@ -176,7 +164,6 @@ export async function computeSettlementSecura(players) {
     if (rec.amt === 0) j++;
   }
 
-  // Loot-holder sell lists (for the items they pasted)
   const lhCounts = new Map();
   for (const it of lootHolder.items) {
     const key = normItemName(it.name);

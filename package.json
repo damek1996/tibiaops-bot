@@ -8,7 +8,6 @@
     "register": "node register-commands.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.1",
     "discord.js": "^14.19.3",
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2"
