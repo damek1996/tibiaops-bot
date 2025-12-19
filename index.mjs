@@ -2,20 +2,24 @@
 import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
 
 import { getPriceSecuraByName, formatGold } from "./provider.mjs";
-import { parsePartyAnalyzerText, parseLooterAnalyzerText, computeCorrectedSettlementSecura } from "./settle.mjs";
+import {
+  parsePartyAnalyzerText,
+  parseLooterAnalyzerText,
+  computeBalanceSettlement,
+  computeSellDecisionsSecura
+} from "./settle.mjs";
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]
 });
 
-// channelId -> { world, party, lootersByName: Map<string, items[]> }
-const sessions = new Map();
+const sessions = new Map(); // channelId -> { world, party, lootersByName: Map<string, items[]> }
 
 function fmtInt(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
 }
 
-function truncate(s, max = 1024) {
+function truncate(s, max = 1500) {
   const str = String(s ?? "");
   return str.length > max ? str.slice(0, max - 3) + "..." : str;
 }
@@ -29,8 +33,7 @@ async function readInputTextFromInteraction(interaction, textOptionName, fileOpt
   if (file?.url) {
     const res = await fetch(file.url);
     if (!res.ok) throw new Error(`Failed to download attachment (${res.status})`);
-    const body = await res.text();
-    return body;
+    return await res.text();
   }
 
   throw new Error("Provide either text OR attach a .txt file.");
@@ -44,9 +47,7 @@ client.on("interactionCreate", async interaction => {
     const item = interaction.options.getString("item", true);
     try {
       const p = await getPriceSecuraByName(item);
-      if (!p.found) {
-        return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
-      }
+      if (!p.found) return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
 
       return interaction.reply({
         content:
@@ -61,9 +62,7 @@ client.on("interactionCreate", async interaction => {
     }
   }
 
-  // /settle
   if (interaction.commandName !== "settle") return;
-
   const sub = interaction.options.getSubcommand();
 
   if (sub === "start") {
@@ -73,9 +72,9 @@ client.on("interactionCreate", async interaction => {
     return interaction.reply({
       content:
         `Settlement started for **${world}**.\n` +
-        `1) Use \`/settle party\` and either paste text or attach a .txt file.\n` +
-        `2) Each player uses \`/settle looter\` and either pastes or attaches their analyzer.\n` +
-        `3) Run \`/settle done\`.`,
+        `1) \`/settle party\` (paste OR attach .txt)\n` +
+        `2) Each player: \`/settle looter\` (paste OR attach .txt)\n` +
+        `3) \`/settle done\``,
       ephemeral: false
     });
   }
@@ -89,30 +88,27 @@ client.on("interactionCreate", async interaction => {
       const party = parsePartyAnalyzerText(partyText);
 
       if (!party.players.length) {
-        // Debug preview so you can see what the bot actually received
-        const preview = partyText.replace(/\r\n/g, "\n").slice(0, 350);
+        const preview = partyText.replace(/\r\n/g, "\n").slice(0, 450);
         return interaction.reply({
           content:
-            `Could not parse players/supplies.\n` +
+            `Could not parse players with Supplies+Balance.\n` +
             `Received length: **${partyText.length}** chars\n` +
             `Preview:\n` +
-            "```text\n" + preview + "\n```" +
-            `Tip: attach a .txt file (recommended).`,
+            "```text\n" + preview + "\n```",
           ephemeral: true
         });
       }
 
       sess.party = party;
-
       const names = party.players.map(p => p.name).join(", ");
+
       return interaction.reply({
         content:
           `Party loaded. Players: **${party.players.length}**\n` +
           `Detected: ${names}\n\n` +
-          `Now each player paste/attach their analyzer using:\n` +
+          `Now each player paste/attach their analyzer:\n` +
           `\`/settle looter name:<exact name>\`\n` +
-          `Paste even if: **Looted Items: None**\n` +
-          `When everyone is done: \`/settle done\`.`,
+          `Paste even if: **Looted Items: None**`,
         ephemeral: false
       });
     } catch (e) {
@@ -125,8 +121,8 @@ client.on("interactionCreate", async interaction => {
     if (!sess?.party) return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
 
     const name = interaction.options.getString("name", true).trim();
-
     const match = sess.party.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+
     if (!match) {
       return interaction.reply({
         content: `Name not found in party list: **${name}**. Use exact name from party analyzer.`,
@@ -137,10 +133,10 @@ client.on("interactionCreate", async interaction => {
     try {
       const looterText = await readInputTextFromInteraction(interaction, "text", "file");
       const parsed = parseLooterAnalyzerText(looterText);
-
       sess.lootersByName.set(match.name, parsed.items ?? []);
+
       return interaction.reply({
-        content: `Captured looter paste for **${match.name}**. Items parsed: **${(parsed.items ?? []).length}**.`,
+        content: `Captured looter analyzer for **${match.name}**. Items parsed: **${(parsed.items ?? []).length}**.`,
         ephemeral: false
       });
     } catch (e) {
@@ -151,45 +147,74 @@ client.on("interactionCreate", async interaction => {
   if (sub === "done") {
     const sess = sessions.get(interaction.channelId);
     if (!sess?.party) return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
+    if ((sess.world ?? "Secura") !== "Secura") return interaction.reply({ content: "MVP supports **Secura** only right now.", ephemeral: true });
 
-    if ((sess.world ?? "Secura") !== "Secura") {
-      return interaction.reply({ content: "MVP supports **Secura** only right now.", ephemeral: true });
+    // Require looter analyzers for sell instructions; settlement can still work without, but you asked to always include it.
+    const missingLooters = sess.party.players
+      .filter(p => !sess.lootersByName.has(p.name))
+      .map(p => p.name);
+
+    if (missingLooters.length) {
+      return interaction.reply({
+        content: `Missing looter analyzer for: ${missingLooters.join(", ")} (paste even if "Looted Items: None").`,
+        ephemeral: true
+      });
     }
 
     try {
-      const result = await computeCorrectedSettlementSecura({
-        party: sess.party,
-        lootersByName: sess.lootersByName
-      });
+      // 1) Settlement using PARTY balances (matches the "proper split")
+      const settlement = computeBalanceSettlement(sess.party);
 
-      const transfersText = result.transfers.length
-        ? result.transfers.map(t => `• **${t.from}** → **${t.to}**: **${fmtInt(t.amount)} gp**`).join("\n")
+      const transfersText = settlement.transfers.length
+        ? settlement.transfers.map(t => `• **${t.from}** → **${t.to}**: **${fmtInt(t.amount)} gp**`).join("\n")
         : "No transfers needed.";
 
-      const summaryLines = result.perPlayer
-        .map(p => {
-          return `• **${p.name}** held ${fmtInt(p.heldLootValue || 0)} | supplies ${fmtInt(p.supplies || 0)} | fair payout ${fmtInt(p.fairPayout || 0)} | delta ${fmtInt(p.delta || 0)}`;
-        })
+      // 2) Sell instructions using BUY vs NPC BUY
+      const sell = await computeSellDecisionsSecura(sess.lootersByName);
+
+      const perPlayerLines = settlement.players
+        .map(p => `• **${p.name}** balance ${fmtInt(p.balance)} | target ${fmtInt(p.target)} | delta ${fmtInt(p.delta)}`)
         .join("\n");
 
       const embed = new EmbedBuilder()
-        .setTitle("Hunt Settlement — Corrected Loot (Market BUY vs NPC BUY) + Equal Split")
-        .setDescription(`World: Secura | Updated: ${result.updatedAt.toISOString()}`)
+        .setTitle("Hunt Settlement — Equal Split (Party Balance) + Sell Instructions")
+        .setDescription(`World: Secura | Market snapshot: ${sell.updatedAt.toISOString()}`)
         .addFields(
           {
             name: "Totals",
             value:
-              `Corrected total loot (best liquidation): **${fmtInt(result.totalHeldLoot)} gp**\n` +
-              `Total supplies: **${fmtInt(result.totalSupplies)} gp**\n` +
-              `Corrected net: **${fmtInt(result.correctedNet)} gp**\n` +
-              `Equal share (profit): **${fmtInt(result.share)} gp**`
+              `Total profit (party balance): **${fmtInt(settlement.totalBalance)} gp**\n` +
+              `Equal share: **${fmtInt(settlement.target)} gp**`
           },
-          { name: "Per-player accounting", value: truncate(summaryLines) },
-          { name: "Transfers (who sends who)", value: truncate(transfersText) }
+          { name: "Per-player balance vs target", value: truncate(perPlayerLines, 1024) },
+          { name: "Transfers (who sends who)", value: truncate(transfersText, 1024) }
         );
 
+      await interaction.reply({ embeds: [embed] });
+
+      // Follow-ups: sell lists per player (so you always get them)
+      for (const p of settlement.players) {
+        const ins = sell.sellInstructionsByPlayer.get(p.name) || { sellBuy: [], sellNpc: [], unmatched: [] };
+
+        const buyList = ins.sellBuy.length
+          ? ins.sellBuy.slice(0, 25).map(x => `- ${x.qty}x ${x.name} (BUY ${fmtInt(x.marketBuy || 0)} | NPC ${fmtInt(x.npcBuy || 0)})`).join("\n")
+          : "- None";
+
+        const npcList = ins.sellNpc.length
+          ? ins.sellNpc.slice(0, 25).map(x => `- ${x.qty}x ${x.name} (NPC ${fmtInt(x.npcBuy || 0)} | BUY ${fmtInt(x.marketBuy || 0)})`).join("\n")
+          : "- None";
+
+        const msg =
+          `**Sell instructions — ${p.name}**\n` +
+          `**Sell on Market (BUY offer):**\n` +
+          "```text\n" + truncate(buyList, 1800) + "\n```\n" +
+          `**Sell to NPC:**\n` +
+          "```text\n" + truncate(npcList, 1800) + "\n```";
+
+        await interaction.followUp({ content: msg });
+      }
+
       sessions.delete(interaction.channelId);
-      return interaction.reply({ embeds: [embed] });
     } catch (e) {
       return interaction.reply({ content: `Settlement failed: ${e.message}`, ephemeral: true });
     }
