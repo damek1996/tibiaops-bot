@@ -5,21 +5,21 @@ import { getPriceSecuraByName, formatGold } from "./provider.mjs";
 import {
   parsePartyAnalyzerText,
   parseLooterAnalyzerText,
-  computeBalanceSettlement,
-  computeSellDecisionsSecura
+  computeCorrectedSettlementSecura
 } from "./settle.mjs";
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]
 });
 
-const sessions = new Map(); // channelId -> { world, party, lootersByName: Map<string, items[]> }
+// channelId -> { world, party, lootersByName: Map<string, items[]> }
+const sessions = new Map();
 
 function fmtInt(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
 }
 
-function truncate(s, max = 1500) {
+function truncate(s, max = 1800) {
   const str = String(s ?? "");
   return str.length > max ? str.slice(0, max - 3) + "..." : str;
 }
@@ -47,7 +47,9 @@ client.on("interactionCreate", async interaction => {
     const item = interaction.options.getString("item", true);
     try {
       const p = await getPriceSecuraByName(item);
-      if (!p.found) return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
+      if (!p.found) {
+        return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
+      }
 
       return interaction.reply({
         content:
@@ -62,6 +64,7 @@ client.on("interactionCreate", async interaction => {
     }
   }
 
+  // /settle
   if (interaction.commandName !== "settle") return;
   const sub = interaction.options.getSubcommand();
 
@@ -72,9 +75,9 @@ client.on("interactionCreate", async interaction => {
     return interaction.reply({
       content:
         `Settlement started for **${world}**.\n` +
-        `1) \`/settle party\` (paste OR attach .txt)\n` +
-        `2) Each player: \`/settle looter\` (paste OR attach .txt)\n` +
-        `3) \`/settle done\``,
+        `1) /settle party (paste or attach .txt)\n` +
+        `2) Each player: /settle looter name:<exact party name> (paste or attach .txt)\n` +
+        `3) /settle done`,
       ephemeral: false
     });
   }
@@ -91,24 +94,24 @@ client.on("interactionCreate", async interaction => {
         const preview = partyText.replace(/\r\n/g, "\n").slice(0, 450);
         return interaction.reply({
           content:
-            `Could not parse players with Supplies+Balance.\n` +
+            `Could not parse party players (Supplies required).\n` +
             `Received length: **${partyText.length}** chars\n` +
             `Preview:\n` +
-            "```text\n" + preview + "\n```",
+            "```text\n" + preview + "\n```\n" +
+            `Tip: attach the party analyzer as a .txt file.`,
           ephemeral: true
         });
       }
 
       sess.party = party;
-      const names = party.players.map(p => p.name).join(", ");
 
+      const names = party.players.map(p => p.name).join(", ");
       return interaction.reply({
         content:
           `Party loaded. Players: **${party.players.length}**\n` +
           `Detected: ${names}\n\n` +
-          `Now each player paste/attach their analyzer:\n` +
-          `\`/settle looter name:<exact name>\`\n` +
-          `Paste even if: **Looted Items: None**`,
+          `Now each player paste/attach their analyzer (even if Looted Items: None):\n` +
+          `Use: /settle looter name:<exact name>`,
         ephemeral: false
       });
     } catch (e) {
@@ -118,14 +121,16 @@ client.on("interactionCreate", async interaction => {
 
   if (sub === "looter") {
     const sess = sessions.get(interaction.channelId);
-    if (!sess?.party) return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
+    if (!sess?.party) {
+      return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
+    }
 
-    const name = interaction.options.getString("name", true).trim();
-    const match = sess.party.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+    const nameInput = interaction.options.getString("name", true).trim();
+    const match = sess.party.players.find(p => p.name.toLowerCase() === nameInput.toLowerCase());
 
     if (!match) {
       return interaction.reply({
-        content: `Name not found in party list: **${name}**. Use exact name from party analyzer.`,
+        content: `Name not found in party list: **${nameInput}**. Use exact name from party analyzer.`,
         ephemeral: true
       });
     }
@@ -133,8 +138,8 @@ client.on("interactionCreate", async interaction => {
     try {
       const looterText = await readInputTextFromInteraction(interaction, "text", "file");
       const parsed = parseLooterAnalyzerText(looterText);
-      sess.lootersByName.set(match.name, parsed.items ?? []);
 
+      sess.lootersByName.set(match.name, parsed.items ?? []);
       return interaction.reply({
         content: `Captured looter analyzer for **${match.name}**. Items parsed: **${(parsed.items ?? []).length}**.`,
         ephemeral: false
@@ -149,59 +154,58 @@ client.on("interactionCreate", async interaction => {
     if (!sess?.party) return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
     if ((sess.world ?? "Secura") !== "Secura") return interaction.reply({ content: "MVP supports **Secura** only right now.", ephemeral: true });
 
-    // Require looter analyzers for sell instructions; settlement can still work without, but you asked to always include it.
-    const missingLooters = sess.party.players
-      .filter(p => !sess.lootersByName.has(p.name))
-      .map(p => p.name);
-
-    if (missingLooters.length) {
+    const missing = sess.party.players.filter(p => !sess.lootersByName.has(p.name)).map(p => p.name);
+    if (missing.length) {
       return interaction.reply({
-        content: `Missing looter analyzer for: ${missingLooters.join(", ")} (paste even if "Looted Items: None").`,
+        content: `Missing looter analyzer for: ${missing.join(", ")} (paste even if "Looted Items: None").`,
         ephemeral: true
       });
     }
 
     try {
-      // 1) Settlement using PARTY balances (matches the "proper split")
-      const settlement = computeBalanceSettlement(sess.party);
+      const result = await computeCorrectedSettlementSecura({
+        party: sess.party,
+        lootersByName: sess.lootersByName
+      });
 
-      const transfersText = settlement.transfers.length
-        ? settlement.transfers.map(t => `• **${t.from}** → **${t.to}**: **${fmtInt(t.amount)} gp**`).join("\n")
+      const transfersText = result.transfers.length
+        ? result.transfers.map(t => `• **${t.from}** → **${t.to}**: **${fmtInt(t.amount)} gp**`).join("\n")
         : "No transfers needed.";
 
-      // 2) Sell instructions using BUY vs NPC BUY
-      const sell = await computeSellDecisionsSecura(sess.lootersByName);
-
-      const perPlayerLines = settlement.players
-        .map(p => `• **${p.name}** balance ${fmtInt(p.balance)} | target ${fmtInt(p.target)} | delta ${fmtInt(p.delta)}`)
+      const perPlayerLines = result.perPlayer
+        .map(p =>
+          `• **${p.name}** held ${fmtInt(p.heldLootValue)} | supplies ${fmtInt(p.supplies)} | fair payout ${fmtInt(p.fairPayout)} | delta ${fmtInt(p.delta)}`
+        )
         .join("\n");
 
       const embed = new EmbedBuilder()
-        .setTitle("Hunt Settlement — Equal Split (Party Balance) + Sell Instructions")
-        .setDescription(`World: Secura | Market snapshot: ${sell.updatedAt.toISOString()}`)
+        .setTitle("Hunt Settlement — Corrected Loot (Market BUY vs NPC BUY) + Equal Split")
+        .setDescription(`World: Secura | Market snapshot: ${result.updatedAt.toISOString()}`)
         .addFields(
           {
             name: "Totals",
             value:
-              `Total profit (party balance): **${fmtInt(settlement.totalBalance)} gp**\n` +
-              `Equal share: **${fmtInt(settlement.target)} gp**`
+              `Corrected total loot (best liquidation): **${fmtInt(result.totalHeldLoot)} gp**\n` +
+              `Total supplies: **${fmtInt(result.totalSupplies)} gp**\n` +
+              `Corrected net: **${fmtInt(result.correctedNet)} gp**\n` +
+              `Equal share (profit): **${fmtInt(result.share)} gp**`
           },
-          { name: "Per-player balance vs target", value: truncate(perPlayerLines, 1024) },
+          { name: "Per-player accounting", value: truncate(perPlayerLines, 1024) },
           { name: "Transfers (who sends who)", value: truncate(transfersText, 1024) }
         );
 
       await interaction.reply({ embeds: [embed] });
 
-      // Follow-ups: sell lists per player (so you always get them)
-      for (const p of settlement.players) {
-        const ins = sell.sellInstructionsByPlayer.get(p.name) || { sellBuy: [], sellNpc: [], unmatched: [] };
+      // Follow-ups: sell instructions per player
+      for (const p of result.perPlayer) {
+        const ins = result.sellInstructionsByPlayer.get(p.name) || { sellBuy: [], sellNpc: [], unmatched: [] };
 
         const buyList = ins.sellBuy.length
-          ? ins.sellBuy.slice(0, 25).map(x => `- ${x.qty}x ${x.name} (BUY ${fmtInt(x.marketBuy || 0)} | NPC ${fmtInt(x.npcBuy || 0)})`).join("\n")
+          ? ins.sellBuy.slice(0, 30).map(x => `- ${x.qty}x ${x.name} (BUY ${fmtInt(x.marketBuy)} | NPC ${fmtInt(x.npcBuy)})`).join("\n")
           : "- None";
 
         const npcList = ins.sellNpc.length
-          ? ins.sellNpc.slice(0, 25).map(x => `- ${x.qty}x ${x.name} (NPC ${fmtInt(x.npcBuy || 0)} | BUY ${fmtInt(x.marketBuy || 0)})`).join("\n")
+          ? ins.sellNpc.slice(0, 30).map(x => `- ${x.qty}x ${x.name} (NPC ${fmtInt(x.npcBuy)} | BUY ${fmtInt(x.marketBuy)})`).join("\n")
           : "- None";
 
         const msg =
