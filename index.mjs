@@ -12,8 +12,7 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]
 });
 
-// channelId -> { world, party, lootersByName: Map<string, items[]> }
-const sessions = new Map();
+const sessions = new Map(); // channelId -> { world, party, lootersByName: Map<string, items[]> }
 
 function fmtInt(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
@@ -168,13 +167,16 @@ client.on("interactionCreate", async interaction => {
         lootersByName: sess.lootersByName
       });
 
+      const nPlayers = result.perPlayer.length;
+      const remainder = result.correctedNet - (result.share * nPlayers);
+
       const transfersText = result.transfers.length
         ? result.transfers.map(t => `• **${t.from}** → **${t.to}**: **${fmtInt(t.amount)} gp**`).join("\n")
         : "No transfers needed.";
 
       const perPlayerLines = result.perPlayer
         .map(p =>
-          `• **${p.name}** held ${fmtInt(p.heldLootValue)} | supplies ${fmtInt(p.supplies)} | fair payout ${fmtInt(p.fairPayout)} | delta ${fmtInt(p.delta)}`
+          `• **${p.name}** held ${fmtInt(p.heldLootValue)} | supplies ${fmtInt(p.supplies)} | fair payout ${fmtInt(p.fairPayout)} | profit ${fmtInt(result.share)} | delta ${fmtInt(p.delta)}`
         )
         .join("\n");
 
@@ -185,10 +187,12 @@ client.on("interactionCreate", async interaction => {
           {
             name: "Totals",
             value:
+              `Players: **${nPlayers}**\n` +
               `Corrected total loot (best liquidation): **${fmtInt(result.totalHeldLoot)} gp**\n` +
               `Total supplies: **${fmtInt(result.totalSupplies)} gp**\n` +
-              `Corrected net: **${fmtInt(result.correctedNet)} gp**\n` +
-              `Equal share (profit): **${fmtInt(result.share)} gp**`
+              `Corrected net profit: **${fmtInt(result.correctedNet)} gp**\n` +
+              `Profit per player (equal): **${fmtInt(result.share)} gp**\n` +
+              `Remainder (due to rounding): **${fmtInt(remainder)} gp**`
           },
           { name: "Per-player accounting", value: truncate(perPlayerLines, 1024) },
           { name: "Transfers (who sends who)", value: truncate(transfersText, 1024) }
