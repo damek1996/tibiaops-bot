@@ -245,6 +245,7 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (sub === "done") {
+await interaction.deferReply({ ephemeral: false });
     const sess = sessions.get(interaction.channelId);
     if (!sess?.party) return interaction.reply({ content: "Paste party first using `/settle party`.", ephemeral: true });
 

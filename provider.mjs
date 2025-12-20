@@ -1,13 +1,11 @@
 import "dotenv/config";
 
-// ===== Config =====
 export const TIBIA_MARKET_BASE_URL =
   process.env.TIBIA_MARKET_BASE_URL?.trim() || "https://api.tibiamarket.top";
 
-// API rate limit you hit: ~1 request / 5 seconds
+// API limit: 1 request / 5 seconds
 const RATE_LIMIT_MS = 5200;
 
-// Simple in-process throttling
 let lastRequestAt = 0;
 async function throttle() {
   const now = Date.now();
@@ -16,14 +14,6 @@ async function throttle() {
   lastRequestAt = Date.now();
 }
 
-// Small in-memory caches to reduce calls
-let metadataCache = null; // item_metadata result array
-let metadataLoadedAt = 0;
-
-const marketSnapshotCache = new Map(); // key=server -> {updatedAt, items: Map(nameNorm -> {buy,sell,raw}), loadedAt}
-const marketBoardCache = new Map(); // key=`${server}:${itemId}` -> {board, loadedAt}
-
-// ===== Helpers =====
 export function normItemName(name) {
   return String(name ?? "")
     .toLowerCase()
@@ -38,14 +28,9 @@ export function formatGold(n) {
 
 async function fetchJson(url) {
   await throttle();
-  const res = await fetch(url, {
-    headers: { "accept": "application/json" }
-  });
+  const res = await fetch(url, { headers: { accept: "application/json" } });
   const text = await res.text();
-  if (!res.ok) {
-    // include body for debugging
-    throw new Error(`API ${res.status} for ${url}: ${text}`);
-  }
+  if (!res.ok) throw new Error(`API ${res.status} for ${url}: ${text}`);
   try {
     return JSON.parse(text);
   } catch {
@@ -53,15 +38,16 @@ async function fetchJson(url) {
   }
 }
 
-// ===== Item metadata (IDs + NPC buyers) =====
+// ---- Metadata cache ----
+let metadataCache = null;
+let metadataLoadedAt = 0;
+
 export async function loadItemMetadata() {
-  // refresh every 6 hours
   const now = Date.now();
   if (metadataCache && (now - metadataLoadedAt) < 6 * 60 * 60 * 1000) return metadataCache;
 
   const url = `${TIBIA_MARKET_BASE_URL}/item_metadata`;
   const arr = await fetchJson(url);
-
   if (!Array.isArray(arr)) throw new Error("item_metadata did not return an array");
 
   metadataCache = arr;
@@ -72,40 +58,17 @@ export async function loadItemMetadata() {
 export async function getItemIdByName(nameNorm) {
   const meta = await loadItemMetadata();
   const target = normItemName(nameNorm);
-
-  // exact match against normalized name
   const found = meta.find(x => normItemName(x?.name) === target);
   return found?.id ?? null;
 }
 
-export async function getNpcBuyById(itemId) {
-  const meta = await loadItemMetadata();
-  const it = meta.find(x => x?.id === itemId);
-  if (!it) return 0;
-
-  // IMPORTANT:
-  // We want "NPC BUY" meaning: NPC buys from players (you SELL to NPC).
-  // Your metadata structure typically contains npc_buy[] and npc_sell[] arrays.
-  // npc_buy should be the NPC buying from players (we use highest price available).
-  const buyers = Array.isArray(it.npc_buy) ? it.npc_buy : [];
-  if (!buyers.length) return 0;
-
-  // pick maximum buy price
-  let best = 0;
-  for (const b of buyers) {
-    const p = Number(b?.price ?? b?.amount ?? b?.value ?? 0);
-    if (Number.isFinite(p) && p > best) best = p;
-  }
-  return best;
-}
-
+// NPC BUY = NPC buys from player (you sell to NPC)
 export async function getNpcBuyersById(itemId) {
   const meta = await loadItemMetadata();
   const it = meta.find(x => x?.id === itemId);
   if (!it) return [];
 
   const buyers = Array.isArray(it.npc_buy) ? it.npc_buy : [];
-  // Normalize into {name, price}
   return buyers
     .map(b => ({
       name: String(b?.name ?? "").trim(),
@@ -115,119 +78,19 @@ export async function getNpcBuyersById(itemId) {
     .sort((a, b) => b.price - a.price);
 }
 
-// ===== Market values snapshot =====
-// Pulls all market_values pages for Secura and builds a name->buy/sell map
-async function fetchMarketValuesPaged(server) {
-  const all = [];
-  let skip = 0;
-  const limit = 100;
-
-  // careful: this API is rate-limited; paging is expensive.
-  // we keep it cached and refresh only every 5 minutes.
-  while (true) {
-    const url =
-      `${TIBIA_MARKET_BASE_URL}/market_values` +
-      `?server=${encodeURIComponent(server)}` +
-      `&skip=${skip}&limit=${limit}`;
-
-    const page = await fetchJson(url);
-    if (!Array.isArray(page)) throw new Error("market_values did not return array");
-
-    all.push(...page);
-    if (page.length < limit) break;
-    skip += limit;
-
-    // hard-stop safety
-    if (skip > 20000) break;
-  }
-
-  return all;
+export async function getBestNpcBuyPrice(itemId) {
+  const buyers = await getNpcBuyersById(itemId);
+  return buyers[0]?.price ?? 0;
 }
 
-export async function fetchMarketSnapshotSecura() {
-  return fetchMarketSnapshot("Secura");
-}
+// ---- Market board (depth) ----
+// Cache per (server,itemId) and optionally batch fetch.
+const marketBoardCache = new Map(); // key `${server}:${id}` -> {board, loadedAt}
 
-export async function fetchMarketSnapshot(server) {
-  const key = String(server);
-  const cached = marketSnapshotCache.get(key);
-  const now = Date.now();
-
-  // refresh every 5 minutes
-  if (cached && (now - cached.loadedAt) < 5 * 60 * 1000) return cached;
-
-  const rows = await fetchMarketValuesPaged(server);
-
-  // Build map: nameNorm -> current best buy/sell offers
-  // We need item names; market_values response is per id, so we map id -> name using metadata.
-  const meta = await loadItemMetadata();
-  const idToName = new Map(meta.map(x => [x.id, normItemName(x.name)]));
-
-  const items = new Map();
-  let latestTime = 0;
-
-  for (const r of rows) {
-    const id = r?.id;
-    const nameNorm = idToName.get(id);
-    if (!nameNorm) continue;
-
-    const buy = Number(r?.buy_offer ?? 0);
-    const sell = Number(r?.sell_offer ?? 0);
-    const t = Number(r?.time ?? 0);
-    if (Number.isFinite(t) && t > latestTime) latestTime = t;
-
-    items.set(nameNorm, {
-      buy: Number.isFinite(buy) ? buy : 0,
-      sell: Number.isFinite(sell) ? sell : 0,
-      raw: r
-    });
-  }
-
-  const snap = {
-    updatedAt: latestTime ? new Date(latestTime * 1000) : new Date(),
-    items,
-    loadedAt: now
-  };
-
-  marketSnapshotCache.set(key, snap);
-  return snap;
-}
-
-export async function getPriceSecuraByName(itemName) {
-  const nameNorm = normItemName(itemName);
-  const snap = await fetchMarketSnapshotSecura();
-  const found = snap.items.get(nameNorm);
-  if (!found) return { found: false, reason: "item not found", buy: null, sell: null, updatedAt: snap.updatedAt };
-  return { found: true, buy: found.buy, sell: found.sell, updatedAt: snap.updatedAt };
-}
-
-// ===== Market depth (market_board) =====
-export async function fetchMarketBoard(server, itemId) {
-  const key = `${server}:${itemId}`;
-  const cached = marketBoardCache.get(key);
-  const now = Date.now();
-
-  // cache depth 60 seconds (enough for settlement)
-  if (cached && (now - cached.loadedAt) < 60 * 1000) return cached.board;
-
-  const url =
-    `${TIBIA_MARKET_BASE_URL}/market_board` +
-    `?server=${encodeURIComponent(server)}&item_ids=${encodeURIComponent(itemId)}`;
-
-  const board = await fetchJson(url);
-
-  // board schema you posted:
-  // { id, sellers:[{amount,price,time}], buyers:[...], update_time }
-  marketBoardCache.set(key, { board, loadedAt: now });
-  return board;
-}
-
-// Consume BUY depth for qty, return expected proceeds selling instantly
 export function computeInstantSellValueFromBoard(board, qty) {
   const buyers = Array.isArray(board?.buyers) ? board.buyers : [];
   if (!buyers.length) return { value: 0, filled: 0, remaining: qty, usedLevels: [] };
 
-  // Sort by price desc, then time desc
   const levels = buyers
     .map(x => ({
       price: Number(x?.price ?? 0),
@@ -245,11 +108,57 @@ export function computeInstantSellValueFromBoard(board, qty) {
     if (remaining <= 0) break;
     const take = Math.min(remaining, lvl.amount);
     if (take <= 0) continue;
-
     value += take * lvl.price;
     usedLevels.push({ price: lvl.price, amount: take });
     remaining -= take;
   }
 
   return { value, filled: qty - remaining, remaining, usedLevels };
+}
+
+// Fetch market board for multiple IDs (best effort).
+// Some APIs return array for multiple ids; some return single object.
+// We support BOTH: if array -> map each; if object -> map id->object.
+export async function fetchMarketBoards(server, itemIds) {
+  const now = Date.now();
+  const out = new Map();
+
+  // Use cache for fresh boards (<60s)
+  const missing = [];
+  for (const id of itemIds) {
+    const key = `${server}:${id}`;
+    const c = marketBoardCache.get(key);
+    if (c && (now - c.loadedAt) < 60 * 1000) out.set(id, c.board);
+    else missing.push(id);
+  }
+  if (!missing.length) return out;
+
+  // Batch in chunks to reduce calls
+  const chunkSize = 50;
+  for (let i = 0; i < missing.length; i += chunkSize) {
+    const chunk = missing.slice(i, i + chunkSize);
+    const url =
+      `${TIBIA_MARKET_BASE_URL}/market_board` +
+      `?server=${encodeURIComponent(server)}` +
+      `&item_ids=${encodeURIComponent(chunk.join(","))}`;
+
+    const data = await fetchJson(url);
+
+    if (Array.isArray(data)) {
+      for (const b of data) {
+        const id = Number(b?.id);
+        if (!Number.isFinite(id)) continue;
+        marketBoardCache.set(`${server}:${id}`, { board: b, loadedAt: Date.now() });
+        out.set(id, b);
+      }
+    } else if (data && typeof data === "object") {
+      const id = Number(data?.id);
+      if (Number.isFinite(id)) {
+        marketBoardCache.set(`${server}:${id}`, { board: data, loadedAt: Date.now() });
+        out.set(id, data);
+      }
+    }
+  }
+
+  return out;
 }
