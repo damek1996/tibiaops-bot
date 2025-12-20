@@ -84,7 +84,6 @@ export async function getBestNpcBuyPrice(itemId) {
 }
 
 // ---- Market board (depth) ----
-// Cache per (server,itemId) and optionally batch fetch.
 const marketBoardCache = new Map(); // key `${server}:${id}` -> {board, loadedAt}
 
 export function computeInstantSellValueFromBoard(board, qty) {
@@ -116,14 +115,23 @@ export function computeInstantSellValueFromBoard(board, qty) {
   return { value, filled: qty - remaining, remaining, usedLevels };
 }
 
-// Fetch market board for multiple IDs (best effort).
-// Some APIs return array for multiple ids; some return single object.
-// We support BOTH: if array -> map each; if object -> map id->object.
+function topPriceFromSide(sideArr, descending = true) {
+  const arr = Array.isArray(sideArr) ? sideArr : [];
+  const levels = arr
+    .map(x => ({ price: Number(x?.price ?? 0), amount: Number(x?.amount ?? 0), time: Number(x?.time ?? 0) }))
+    .filter(x => Number.isFinite(x.price) && x.price > 0 && Number.isFinite(x.amount) && x.amount > 0)
+    .sort((a, b) => {
+      if (descending) return (b.price - a.price) || (b.time - a.time);
+      return (a.price - b.price) || (b.time - a.time);
+    });
+  return levels[0]?.price ?? 0;
+}
+
+// Batch fetch boards for multiple IDs
 export async function fetchMarketBoards(server, itemIds) {
   const now = Date.now();
   const out = new Map();
 
-  // Use cache for fresh boards (<60s)
   const missing = [];
   for (const id of itemIds) {
     const key = `${server}:${id}`;
@@ -133,10 +141,10 @@ export async function fetchMarketBoards(server, itemIds) {
   }
   if (!missing.length) return out;
 
-  // Batch in chunks to reduce calls
   const chunkSize = 50;
   for (let i = 0; i < missing.length; i += chunkSize) {
     const chunk = missing.slice(i, i + chunkSize);
+
     const url =
       `${TIBIA_MARKET_BASE_URL}/market_board` +
       `?server=${encodeURIComponent(server)}` +
@@ -161,4 +169,25 @@ export async function fetchMarketBoards(server, itemIds) {
   }
 
   return out;
+}
+
+// Convenience: price check for a single item name on Secura using market_board
+export async function getPriceSecuraByName(itemName) {
+  const nameNorm = normItemName(itemName);
+  const id = await getItemIdByName(nameNorm);
+  if (!Number.isFinite(id)) {
+    return { found: false, reason: "item not found in metadata", buy: null, sell: null, updatedAt: new Date() };
+  }
+
+  const boards = await fetchMarketBoards("Secura", [id]);
+  const board = boards.get(id);
+  if (!board) {
+    return { found: false, reason: "no board data", buy: null, sell: null, updatedAt: new Date() };
+  }
+
+  const buy = topPriceFromSide(board.buyers, true);     // highest buy
+  const sell = topPriceFromSide(board.sellers, false);  // lowest sell
+  const updatedAt = board.update_time ? new Date(Number(board.update_time) * 1000) : new Date();
+
+  return { found: true, buy, sell, updatedAt };
 }
