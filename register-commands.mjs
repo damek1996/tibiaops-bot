@@ -20,7 +20,7 @@ const commands = [
   },
   {
     name: "settle",
-    description: "Corrected loot (BUY vs NPC BUY) + equal split + direct transfers",
+    description: "Corrected loot + equal split + transfers + sell browser",
     options: [
       {
         type: 1,
@@ -38,7 +38,7 @@ const commands = [
           {
             type: 3,
             name: "text",
-            description: "Paste Party Hunt Analyzer (short) OR leave empty and attach a .txt",
+            description: "Paste Party Hunt Analyzer OR leave empty and attach a .txt",
             required: false,
             max_length: 6000
           },
@@ -53,13 +53,19 @@ const commands = [
       {
         type: 1,
         name: "looter",
-        description: "Provide player's analyzer with Looted Items (text OR attachment .txt)",
+        description: "Provide player's analyzer with Looted Items (pick name from autocomplete)",
         options: [
-          { type: 3, name: "name", description: "Exact player name from party analyzer", required: true, max_length: 100 },
+          {
+            type: 3,
+            name: "name",
+            description: "Pick player name from suggestions",
+            required: true,
+            autocomplete: true
+          },
           {
             type: 3,
             name: "text",
-            description: "Paste player analyzer (short) OR leave empty and attach a .txt",
+            description: "Paste player analyzer OR leave empty and attach a .txt",
             required: false,
             max_length: 6000
           },
@@ -74,14 +80,13 @@ const commands = [
       {
         type: 1,
         name: "done",
-        description: "Compute transfers + sell routes now"
+        description: "Compute corrected loot, transfers, and create sell browser"
       }
     ]
   }
 ];
 
 const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
-
 console.log("Registering slash commands...");
 await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
 console.log("Done.");

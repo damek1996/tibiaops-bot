@@ -1,5 +1,11 @@
 ﻿import "dotenv/config";
-import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder
+} from "discord.js";
 
 import { getPriceSecuraByName, formatGold } from "./provider.mjs";
 import {
@@ -12,23 +18,24 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]
 });
 
-const sessions = new Map(); // channelId -> { world, party, lootersByName: Map<string, items[]> }
+// channelId -> { world, party, lootersByName: Map<string, items[]> }
+const sessions = new Map();
+
+// messageId -> { perPlayer, sellInstructionsByPlayer, updatedAt }
+const sellBrowserState = new Map();
 
 function fmtInt(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
 }
-
+function gp(n) {
+  return `${fmtInt(n)} gp`;
+}
 function truncate(s, max = 1800) {
   const str = String(s ?? "");
   return str.length > max ? str.slice(0, max - 3) + "..." : str;
 }
-
-function gp(n) {
-  return `${fmtInt(n)} gp`;
-}
-
-function monospaceBlock(lines) {
-  return "```text\n" + lines.join("\n") + "\n```";
+function monospaceBlock(text) {
+  return "```text\n" + text + "\n```";
 }
 
 async function readInputTextFromInteraction(interaction, textOptionName, fileOptionName) {
@@ -46,24 +53,124 @@ async function readInputTextFromInteraction(interaction, textOptionName, fileOpt
   throw new Error("Provide either text OR attach a .txt file.");
 }
 
+function buildSellEmbed(playerName, ins, updatedAt) {
+  const sellBuy = (ins?.sellBuy ?? []).slice(0, 12);
+  const sellNpc = (ins?.sellNpc ?? []).slice(0, 12);
+  const unmatched = (ins?.unmatched ?? []).slice(0, 10);
+
+  const buyLines = sellBuy.length
+    ? sellBuy.map(x =>
+        `${String(x.qty).padStart(4)}x ${String(x.name).padEnd(30)} | BUY ${fmtInt(x.marketBuy).padStart(8)} | NPC ${fmtInt(x.npcBuy).padStart(8)}`
+      ).join("\n")
+    : "(none)";
+
+  const npcLines = sellNpc.length
+    ? sellNpc.map(x =>
+        `${String(x.qty).padStart(4)}x ${String(x.name).padEnd(30)} | NPC ${fmtInt(x.npcBuy).padStart(8)} | BUY ${fmtInt(x.marketBuy).padStart(8)}`
+      ).join("\n")
+    : "(none)";
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🧺 Sell instructions — ${playerName}`)
+    .setDescription(`Snapshot: ${updatedAt.toISOString()}\nRule: value per item = max(Market BUY, NPC BUY).`)
+    .addFields(
+      { name: "🟦 Sell on Market (BUY offer) — top items", value: monospaceBlock(truncate(buyLines, 900)), inline: false },
+      { name: "🟨 Sell to NPC — top items", value: monospaceBlock(truncate(npcLines, 900)), inline: false }
+    );
+
+  if (unmatched.length) {
+    const u = unmatched.map(x => `${x.qty}x ${x.name}`).join("\n");
+    embed.addFields({ name: "⚠️ Unmatched items", value: monospaceBlock(truncate(u, 900)), inline: false });
+  }
+
+  return embed;
+}
+
+function buildSellBrowserRow(messageId, players, defaultName = null) {
+  const options = players.slice(0, 25).map(p => ({
+    label: p.name,
+    value: p.name,
+    default: defaultName ? p.name === defaultName : false
+  }));
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`sellbrowser:${messageId}`)
+    .setPlaceholder("Select your character…")
+    .addOptions(options);
+
+  return new ActionRowBuilder().addComponents(menu);
+}
+
 function groupTransfersByPayer(transfers) {
-  const m = new Map(); // payer -> [{to, amount}]
+  const m = new Map();
   for (const t of transfers) {
     if (!m.has(t.from)) m.set(t.from, []);
     m.get(t.from).push({ to: t.to, amount: t.amount });
   }
-  for (const [k, arr] of m.entries()) {
-    arr.sort((a, b) => b.amount - a.amount);
-    m.set(k, arr);
-  }
+  for (const [k, arr] of m.entries()) arr.sort((a, b) => b.amount - a.amount);
   return m;
 }
 
-function topRows(rows, max = 8) {
-  return (rows ?? []).slice(0, max);
-}
-
 client.on("interactionCreate", async interaction => {
+  // 1) Autocomplete handler for /settle looter name
+  if (interaction.isAutocomplete()) {
+    try {
+      const cmd = interaction.commandName;
+      if (cmd !== "settle") return;
+
+      const sub = interaction.options.getSubcommand(false);
+      if (sub !== "looter") return;
+
+      const sess = sessions.get(interaction.channelId);
+      const party = sess?.party;
+      const focused = interaction.options.getFocused(true);
+
+      if (focused?.name !== "name") return;
+
+      const q = String(focused.value ?? "").toLowerCase().trim();
+      const players = party?.players ?? [];
+
+      // filter by query, and only show up to 25
+      const matches = players
+        .map(p => p.name)
+        .filter(name => (q ? name.toLowerCase().includes(q) : true))
+        .slice(0, 25);
+
+      // Must respond with {name,value} list
+      return interaction.respond(matches.map(n => ({ name: n, value: n })));
+    } catch (e) {
+      // If autocomplete fails, respond with empty set to avoid Discord errors
+      try { return interaction.respond([]); } catch {}
+      return;
+    }
+  }
+
+  // 2) Dropdown interactions (sell browser)
+  if (interaction.isStringSelectMenu()) {
+    try {
+      const id = interaction.customId || "";
+      if (!id.startsWith("sellbrowser:")) return;
+
+      const msgId = id.split(":")[1];
+      const state = sellBrowserState.get(msgId);
+      if (!state) {
+        return interaction.reply({ content: "This sell browser expired. Run a new /settle done.", ephemeral: true });
+      }
+
+      const selectedName = interaction.values?.[0];
+      if (!selectedName) return interaction.reply({ content: "No selection.", ephemeral: true });
+
+      const ins = state.sellInstructionsByPlayer.get(selectedName) || { sellBuy: [], sellNpc: [], unmatched: [] };
+      const embed = buildSellEmbed(selectedName, ins, state.updatedAt);
+      const row = buildSellBrowserRow(msgId, state.perPlayer, selectedName);
+
+      return interaction.update({ embeds: [embed], components: [row] });
+    } catch (e) {
+      return interaction.reply({ content: `Select failed: ${e.message}`, ephemeral: true });
+    }
+  }
+
+  // 3) Slash commands
   if (!interaction.isChatInputCommand()) return;
 
   // /price
@@ -71,9 +178,7 @@ client.on("interactionCreate", async interaction => {
     const item = interaction.options.getString("item", true);
     try {
       const p = await getPriceSecuraByName(item);
-      if (!p.found) {
-        return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
-      }
+      if (!p.found) return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
 
       const embed = new EmbedBuilder()
         .setTitle(`💱 Price — ${item} (Secura)`)
@@ -102,7 +207,7 @@ client.on("interactionCreate", async interaction => {
       .setDescription(
         `World: **${world}**\n\n` +
         `1) Use **/settle party** (paste or attach .txt)\n` +
-        `2) Each player uses **/settle looter** (paste or attach .txt)\n` +
+        `2) Each player uses **/settle looter** (pick name from autocomplete, paste/attach)\n` +
         `3) Run **/settle done**`
       );
 
@@ -138,9 +243,7 @@ client.on("interactionCreate", async interaction => {
         .setDescription(`Players (**${party.players.length}**):\n${names}`)
         .addFields({
           name: "Next",
-          value:
-            `Each player paste/attach their analyzer (even if **Looted Items: None**):\n` +
-            `Use: **/settle looter name:<exact name>**`
+          value: `Each player: **/settle looter** → click name from autocomplete → paste/attach analyzer (even if **Looted Items: None**)`
         });
 
       return interaction.reply({ embeds: [embed], ephemeral: false });
@@ -151,16 +254,13 @@ client.on("interactionCreate", async interaction => {
 
   if (sub === "looter") {
     const sess = sessions.get(interaction.channelId);
-    if (!sess?.party) {
-      return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
-    }
+    if (!sess?.party) return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
 
     const nameInput = interaction.options.getString("name", true).trim();
     const match = sess.party.players.find(p => p.name.toLowerCase() === nameInput.toLowerCase());
-
     if (!match) {
       return interaction.reply({
-        content: `Name not found in party list: **${nameInput}**. Use exact name from party analyzer.`,
+        content: `Name not found in party list: **${nameInput}**. Use the autocomplete list.`,
         ephemeral: true
       });
     }
@@ -204,37 +304,31 @@ client.on("interactionCreate", async interaction => {
       const nPlayers = result.perPlayer.length;
       const remainder = result.correctedNet - (result.share * nPlayers);
 
-      // Summary embed
+      // Summary
       const summary = new EmbedBuilder()
         .setTitle("✅ Settlement complete — Corrected loot + Equal split")
         .setDescription(`World: **Secura** • Snapshot: ${result.updatedAt.toISOString()}`)
-        .addFields(
-          {
-            name: "💰 Totals",
-            value:
-              `Players: **${nPlayers}**\n` +
-              `Corrected loot: **${gp(result.totalHeldLoot)}**\n` +
-              `Supplies: **${gp(result.totalSupplies)}**\n` +
-              `Net profit: **${gp(result.correctedNet)}**\n` +
-              `Profit per player: **${gp(result.share)}**\n` +
-              `Remainder: **${gp(remainder)}**`
-          }
-        );
-
-      const accountingLines = result.perPlayer
-        .map(p => {
-          const sign = p.delta >= 0 ? "+" : "-";
-          return `${p.name.padEnd(16)} held ${fmtInt(p.heldLootValue).padStart(10)} | sup ${fmtInt(p.supplies).padStart(9)} | payout ${fmtInt(p.fairPayout).padStart(10)} | delta ${sign}${fmtInt(Math.abs(p.delta)).padStart(10)}`;
+        .addFields({
+          name: "💰 Totals",
+          value:
+            `Players: **${nPlayers}**\n` +
+            `Corrected loot: **${gp(result.totalHeldLoot)}**\n` +
+            `Supplies: **${gp(result.totalSupplies)}**\n` +
+            `Net profit: **${gp(result.correctedNet)}**\n` +
+            `Profit per player: **${gp(result.share)}**\n` +
+            `Remainder: **${gp(remainder)}**`
         });
 
-      summary.addFields({
-        name: "🧮 Per-player accounting (held vs fair payout)",
-        value: monospaceBlock(truncate(accountingLines.join("\n"), 900).split("\n"))
+      const accountingLines = result.perPlayer.map(p => {
+        const sign = p.delta >= 0 ? "+" : "-";
+        return `${p.name.padEnd(16)} held ${fmtInt(p.heldLootValue).padStart(10)} | sup ${fmtInt(p.supplies).padStart(9)} | payout ${fmtInt(p.fairPayout).padStart(10)} | delta ${sign}${fmtInt(Math.abs(p.delta)).padStart(10)}`;
       });
+
+      summary.addFields({ name: "🧮 Per-player accounting", value: monospaceBlock(truncate(accountingLines.join("\n"), 950)) });
 
       await interaction.reply({ embeds: [summary] });
 
-      // Transfers embed
+      // Transfers (grouped)
       const transfersMap = groupTransfersByPayer(result.transfers);
       const transferLines = [];
 
@@ -243,56 +337,31 @@ client.on("interactionCreate", async interaction => {
       } else {
         for (const [payer, arr] of transfersMap.entries()) {
           transferLines.push(`${payer}:`);
-          for (const x of arr) {
-            transferLines.push(`  -> ${x.to}: ${fmtInt(x.amount)} gp`);
-          }
+          for (const x of arr) transferLines.push(`  -> ${x.to}: ${fmtInt(x.amount)} gp`);
           transferLines.push("");
         }
       }
 
       const transfersEmbed = new EmbedBuilder()
         .setTitle("🏦 Transfers (who sends who)")
-        .setDescription(monospaceBlock(truncate(transferLines.join("\n"), 1800).split("\n")));
+        .setDescription(monospaceBlock(truncate(transferLines.join("\n"), 1800)));
 
       await interaction.followUp({ embeds: [transfersEmbed] });
 
-      // Sell embeds per player
-      for (const p of result.perPlayer) {
-        const ins = result.sellInstructionsByPlayer.get(p.name) || { sellBuy: [], sellNpc: [], unmatched: [] };
+      // Sell browser (public)
+      const browserIntro = new EmbedBuilder()
+        .setTitle("🧺 Sell instructions browser")
+        .setDescription(`Select your character from the dropdown.\nThis message updates in-place (visible to everyone).`);
 
-        const buyTop = topRows(ins.sellBuy, 10);
-        const npcTop = topRows(ins.sellNpc, 10);
+      const browserMsg = await interaction.followUp({ embeds: [browserIntro], components: [] });
+      const row = buildSellBrowserRow(browserMsg.id, result.perPlayer, null);
+      await browserMsg.edit({ embeds: [browserIntro], components: [row] });
 
-        const buyLines = buyTop.length
-          ? buyTop.map(x => `${String(x.qty).padStart(4)}x ${x.name.padEnd(28)} | BUY ${fmtInt(x.marketBuy).padStart(8)} | NPC ${fmtInt(x.npcBuy).padStart(8)}`)
-          : ["(none)"];
-
-        const npcLines = npcTop.length
-          ? npcTop.map(x => `${String(x.qty).padStart(4)}x ${x.name.padEnd(28)} | NPC ${fmtInt(x.npcBuy).padStart(8)} | BUY ${fmtInt(x.marketBuy).padStart(8)}`)
-          : ["(none)"];
-
-        const unmatchedLines = (ins.unmatched && ins.unmatched.length)
-          ? ins.unmatched.slice(0, 10).map(x => `${x.qty}x ${x.name}`)
-          : [];
-
-        const embed = new EmbedBuilder()
-          .setTitle(`🧺 Sell instructions — ${p.name}`)
-          .setDescription("Rule: value per item = max(Market BUY, NPC BUY).")
-          .addFields(
-            { name: "🟦 Sell on Market (BUY offer) — top items", value: monospaceBlock(buyLines), inline: false },
-            { name: "🟨 Sell to NPC — top items", value: monospaceBlock(npcLines), inline: false }
-          );
-
-        if (unmatchedLines.length) {
-          embed.addFields({
-            name: "⚠️ Unmatched items (name not found in metadata)",
-            value: monospaceBlock(unmatchedLines),
-            inline: false
-          });
-        }
-
-        await interaction.followUp({ embeds: [embed] });
-      }
+      sellBrowserState.set(browserMsg.id, {
+        perPlayer: result.perPlayer.map(p => ({ name: p.name })),
+        sellInstructionsByPlayer: result.sellInstructionsByPlayer,
+        updatedAt: result.updatedAt
+      });
 
       sessions.delete(interaction.channelId);
     } catch (e) {
