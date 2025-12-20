@@ -18,11 +18,8 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]
 });
 
-// channelId -> { world, party, lootersByName: Map<string, items[]> }
-const sessions = new Map();
-
-// messageId -> { perPlayer, sellInstructionsByPlayer, updatedAt }
-const sellBrowserState = new Map();
+const sessions = new Map(); // channelId -> { world, party, lootersByName: Map<string, items[]> }
+const sellBrowserState = new Map(); // messageId -> { perPlayer, sellInstructionsByPlayer, updatedAt }
 
 function fmtInt(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
@@ -54,28 +51,40 @@ async function readInputTextFromInteraction(interaction, textOptionName, fileOpt
 }
 
 function buildSellEmbed(playerName, ins, updatedAt) {
-  const sellBuy = (ins?.sellBuy ?? []).slice(0, 12);
-  const sellNpc = (ins?.sellNpc ?? []).slice(0, 12);
+  const sellMarket = (ins?.sellMarket ?? []).slice(0, 10);
+  const sellNpc = (ins?.sellNpc ?? []).slice(0, 10);
   const unmatched = (ins?.unmatched ?? []).slice(0, 10);
 
-  const buyLines = sellBuy.length
-    ? sellBuy.map(x =>
-        `${String(x.qty).padStart(4)}x ${String(x.name).padEnd(30)} | BUY ${fmtInt(x.marketBuy).padStart(8)} | NPC ${fmtInt(x.npcBuy).padStart(8)}`
-      ).join("\n")
+  const marketLines = sellMarket.length
+    ? sellMarket.map(x => {
+        const levels = (x.usedLevels ?? []).slice(0, 3).map(l => `${l.amount}@${l.price}`).join(", ");
+        const depthNote = levels ? ` depth(${levels}${(x.usedLevels?.length ?? 0) > 3 ? ",..." : ""})` : "";
+        // Suggested offer price: instant sell to BUY offer OR list at SELL offer / monthAvgSell
+        const suggest =
+          x.sellOffer > 0
+            ? `list ${x.sellOffer}`
+            : (x.monthAvgSell > 0 ? `list~${Math.trunc(x.monthAvgSell)}` : "list n/a");
+
+        return `${String(x.qty).padStart(4)}x ${String(x.name).padEnd(28)} | instant≈${fmtInt(x.marketInstantTotal).padStart(10)} | BUY ${fmtInt(x.buyOffer).padStart(8)} | ${suggest}${depthNote}`;
+      }).join("\n")
     : "(none)";
 
   const npcLines = sellNpc.length
-    ? sellNpc.map(x =>
-        `${String(x.qty).padStart(4)}x ${String(x.name).padEnd(30)} | NPC ${fmtInt(x.npcBuy).padStart(8)} | BUY ${fmtInt(x.marketBuy).padStart(8)}`
-      ).join("\n")
+    ? sellNpc.map(x => {
+        const npc = x.bestNpc ? ` -> ${x.bestNpc}` : "";
+        return `${String(x.qty).padStart(4)}x ${String(x.name).padEnd(28)} | npc=${fmtInt(x.npcTotal).padStart(10)} | NPC ${fmtInt(x.npcBuy).padStart(8)}${npc}`;
+      }).join("\n")
     : "(none)";
 
   const embed = new EmbedBuilder()
     .setTitle(`🧺 Sell instructions — ${playerName}`)
-    .setDescription(`Snapshot: ${updatedAt.toISOString()}\nRule: value per item = max(Market BUY, NPC BUY).`)
+    .setDescription(
+      `Snapshot: ${updatedAt.toISOString()}\n` +
+      `Market valuation uses BUY depth if available (buyers amount@price). NPC uses best NPC buy price.`
+    )
     .addFields(
-      { name: "🟦 Sell on Market (BUY offer) — top items", value: monospaceBlock(truncate(buyLines, 900)), inline: false },
-      { name: "🟨 Sell to NPC — top items", value: monospaceBlock(truncate(npcLines, 900)), inline: false }
+      { name: "🟦 Sell on Market (instant via BUY depth) + offer guidance", value: monospaceBlock(truncate(marketLines, 950)), inline: false },
+      { name: "🟨 Sell to NPC (best buyer)", value: monospaceBlock(truncate(npcLines, 950)), inline: false }
     );
 
   if (unmatched.length) {
@@ -112,40 +121,7 @@ function groupTransfersByPayer(transfers) {
 }
 
 client.on("interactionCreate", async interaction => {
-  // 1) Autocomplete handler for /settle looter name
-  if (interaction.isAutocomplete()) {
-    try {
-      const cmd = interaction.commandName;
-      if (cmd !== "settle") return;
-
-      const sub = interaction.options.getSubcommand(false);
-      if (sub !== "looter") return;
-
-      const sess = sessions.get(interaction.channelId);
-      const party = sess?.party;
-      const focused = interaction.options.getFocused(true);
-
-      if (focused?.name !== "name") return;
-
-      const q = String(focused.value ?? "").toLowerCase().trim();
-      const players = party?.players ?? [];
-
-      // filter by query, and only show up to 25
-      const matches = players
-        .map(p => p.name)
-        .filter(name => (q ? name.toLowerCase().includes(q) : true))
-        .slice(0, 25);
-
-      // Must respond with {name,value} list
-      return interaction.respond(matches.map(n => ({ name: n, value: n })));
-    } catch (e) {
-      // If autocomplete fails, respond with empty set to avoid Discord errors
-      try { return interaction.respond([]); } catch {}
-      return;
-    }
-  }
-
-  // 2) Dropdown interactions (sell browser)
+  // Dropdown interactions (sell browser)
   if (interaction.isStringSelectMenu()) {
     try {
       const id = interaction.customId || "";
@@ -160,7 +136,7 @@ client.on("interactionCreate", async interaction => {
       const selectedName = interaction.values?.[0];
       if (!selectedName) return interaction.reply({ content: "No selection.", ephemeral: true });
 
-      const ins = state.sellInstructionsByPlayer.get(selectedName) || { sellBuy: [], sellNpc: [], unmatched: [] };
+      const ins = state.sellInstructionsByPlayer.get(selectedName) || { sellMarket: [], sellNpc: [], unmatched: [] };
       const embed = buildSellEmbed(selectedName, ins, state.updatedAt);
       const row = buildSellBrowserRow(msgId, state.perPlayer, selectedName);
 
@@ -170,7 +146,7 @@ client.on("interactionCreate", async interaction => {
     }
   }
 
-  // 3) Slash commands
+  // Slash commands
   if (!interaction.isChatInputCommand()) return;
 
   // /price
@@ -178,14 +154,17 @@ client.on("interactionCreate", async interaction => {
     const item = interaction.options.getString("item", true);
     try {
       const p = await getPriceSecuraByName(item);
-      if (!p.found) return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
+      if (!p.found) {
+        return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
+      }
 
+      // IMPORTANT: show both BUY and SELL explicitly to avoid confusion
       const embed = new EmbedBuilder()
         .setTitle(`💱 Price — ${item} (Secura)`)
         .setDescription(`Snapshot: ${p.updatedAt.toISOString()}`)
         .addFields(
-          { name: "Market BUY offer", value: p.buy != null ? `**${formatGold(p.buy)} gp**` : "**n/a**", inline: true },
-          { name: "Market SELL offer", value: p.sell != null ? `**${formatGold(p.sell)} gp**` : "**n/a**", inline: true }
+          { name: "Market BUY offer (you sell instantly)", value: p.buy != null ? `**${formatGold(p.buy)} gp**` : "**n/a**", inline: true },
+          { name: "Market SELL offer (you buy instantly)", value: p.sell != null ? `**${formatGold(p.sell)} gp**` : "**n/a**", inline: true }
         );
 
       return interaction.reply({ embeds: [embed], ephemeral: true });
@@ -194,7 +173,7 @@ client.on("interactionCreate", async interaction => {
     }
   }
 
-  // /settle
+  // /settle handling (your existing commands remain unchanged)
   if (interaction.commandName !== "settle") return;
   const sub = interaction.options.getSubcommand();
 
@@ -206,9 +185,9 @@ client.on("interactionCreate", async interaction => {
       .setTitle("🧾 Settlement started")
       .setDescription(
         `World: **${world}**\n\n` +
-        `1) Use **/settle party** (paste or attach .txt)\n` +
-        `2) Each player uses **/settle looter** (pick name from autocomplete, paste/attach)\n` +
-        `3) Run **/settle done**`
+        `1) **/settle party**\n` +
+        `2) Each player: **/settle looter**\n` +
+        `3) **/settle done**`
       );
 
     return interaction.reply({ embeds: [embed], ephemeral: false });
@@ -223,16 +202,7 @@ client.on("interactionCreate", async interaction => {
       const party = parsePartyAnalyzerText(partyText);
 
       if (!party.players.length) {
-        const preview = partyText.replace(/\r\n/g, "\n").slice(0, 450);
-        return interaction.reply({
-          content:
-            `Could not parse party players (Supplies required).\n` +
-            `Received length: **${partyText.length}** chars\n` +
-            `Preview:\n` +
-            "```text\n" + preview + "\n```\n" +
-            `Tip: attach the party analyzer as a .txt file.`,
-          ephemeral: true
-        });
+        return interaction.reply({ content: "Could not parse party players/supplies. Paste full party block.", ephemeral: true });
       }
 
       sess.party = party;
@@ -241,10 +211,7 @@ client.on("interactionCreate", async interaction => {
       const embed = new EmbedBuilder()
         .setTitle("👥 Party loaded")
         .setDescription(`Players (**${party.players.length}**):\n${names}`)
-        .addFields({
-          name: "Next",
-          value: `Each player: **/settle looter** → click name from autocomplete → paste/attach analyzer (even if **Looted Items: None**)`
-        });
+        .addFields({ name: "Next", value: `Each player paste/attach analyzer (even if Looted Items: None): **/settle looter**` });
 
       return interaction.reply({ embeds: [embed], ephemeral: false });
     } catch (e) {
@@ -254,16 +221,11 @@ client.on("interactionCreate", async interaction => {
 
   if (sub === "looter") {
     const sess = sessions.get(interaction.channelId);
-    if (!sess?.party) return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
+    if (!sess?.party) return interaction.reply({ content: "Paste party first using `/settle party`.", ephemeral: true });
 
     const nameInput = interaction.options.getString("name", true).trim();
     const match = sess.party.players.find(p => p.name.toLowerCase() === nameInput.toLowerCase());
-    if (!match) {
-      return interaction.reply({
-        content: `Name not found in party list: **${nameInput}**. Use the autocomplete list.`,
-        ephemeral: true
-      });
-    }
+    if (!match) return interaction.reply({ content: `Name not found in party list: ${nameInput}`, ephemeral: true });
 
     try {
       const looterText = await readInputTextFromInteraction(interaction, "text", "file");
@@ -284,15 +246,11 @@ client.on("interactionCreate", async interaction => {
 
   if (sub === "done") {
     const sess = sessions.get(interaction.channelId);
-    if (!sess?.party) return interaction.reply({ content: "Paste/attach party first using `/settle party`.", ephemeral: true });
-    if ((sess.world ?? "Secura") !== "Secura") return interaction.reply({ content: "MVP supports **Secura** only right now.", ephemeral: true });
+    if (!sess?.party) return interaction.reply({ content: "Paste party first using `/settle party`.", ephemeral: true });
 
     const missing = sess.party.players.filter(p => !sess.lootersByName.has(p.name)).map(p => p.name);
     if (missing.length) {
-      return interaction.reply({
-        content: `Missing looter analyzer for: ${missing.join(", ")} (paste even if "Looted Items: None").`,
-        ephemeral: true
-      });
+      return interaction.reply({ content: `Missing looter analyzer for: ${missing.join(", ")}`, ephemeral: true });
     }
 
     try {
@@ -304,7 +262,6 @@ client.on("interactionCreate", async interaction => {
       const nPlayers = result.perPlayer.length;
       const remainder = result.correctedNet - (result.share * nPlayers);
 
-      // Summary
       const summary = new EmbedBuilder()
         .setTitle("✅ Settlement complete — Corrected loot + Equal split")
         .setDescription(`World: **Secura** • Snapshot: ${result.updatedAt.toISOString()}`)
@@ -328,10 +285,8 @@ client.on("interactionCreate", async interaction => {
 
       await interaction.reply({ embeds: [summary] });
 
-      // Transfers (grouped)
       const transfersMap = groupTransfersByPayer(result.transfers);
       const transferLines = [];
-
       if (result.transfers.length === 0) {
         transferLines.push("No transfers needed.");
       } else {
@@ -348,10 +303,10 @@ client.on("interactionCreate", async interaction => {
 
       await interaction.followUp({ embeds: [transfersEmbed] });
 
-      // Sell browser (public)
+      // Sell browser
       const browserIntro = new EmbedBuilder()
         .setTitle("🧺 Sell instructions browser")
-        .setDescription(`Select your character from the dropdown.\nThis message updates in-place (visible to everyone).`);
+        .setDescription("Select your character from the dropdown. This updates in-place (visible to everyone).");
 
       const browserMsg = await interaction.followUp({ embeds: [browserIntro], components: [] });
       const row = buildSellBrowserRow(browserMsg.id, result.perPlayer, null);

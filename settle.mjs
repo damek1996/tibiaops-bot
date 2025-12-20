@@ -1,6 +1,14 @@
-﻿import { fetchMarketSnapshotSecura, normItemName } from "./provider.mjs";
-import { getItemIdByName, getNpcBuyById } from "./provider.mjs";
+﻿import {
+  fetchMarketSnapshotSecura,
+  fetchMarketBoard,
+  computeInstantSellValueFromBoard,
+  normItemName,
+  getItemIdByName,
+  getNpcBuyById,
+  getNpcBuyersById
+} from "./provider.mjs";
 
+// ===== Parsing helpers =====
 function parseIntComma(s) {
   if (s == null) return null;
   const cleaned = String(s).replace(/,/g, "").trim();
@@ -10,9 +18,24 @@ function parseIntComma(s) {
 
 function stripLeadingJunkName(name) {
   return String(name ?? "")
-    .replace(/^\s*\d+\s+/, "")          // "472 Gregorianeg" -> "Gregorianeg"
-    .replace(/^\s*[-–—•.]+\s*/, "")     // "- Name" -> "Name"
+    .replace(/^\s*\d+\s+/, "")
+    .replace(/\(Leader\)/ig, "")
     .trim();
+}
+
+function isNonPlayerHeading(t) {
+  const s = t.trim();
+  if (!s) return true;
+  if (s.includes(":")) return true;
+  if (/^Session data/i.test(s)) return true;
+  if (/^Session:/i.test(s)) return true;
+  if (/^Loot Type/i.test(s)) return true;
+  if (/^Looted Items/i.test(s)) return true;
+  if (/^Killed Monsters/i.test(s)) return true;
+  if (/^Damage/i.test(s)) return true;
+  if (/^Healing/i.test(s)) return true;
+  if (/^(Market|NPC|Custom)$/i.test(s)) return true;
+  return false;
 }
 
 export function normalizeLootItemName(raw) {
@@ -49,25 +72,7 @@ async function resolveItemId(nameNorm) {
   return null;
 }
 
-function isNonPlayerHeading(t) {
-  const s = t.trim();
-  if (!s) return true;
-  if (s.includes(":")) return true;
-  if (/^Session data/i.test(s)) return true;
-  if (/^Session:/i.test(s)) return true;
-  if (/^Loot Type/i.test(s)) return true;
-  if (/^Looted Items/i.test(s)) return true;
-  if (/^Killed Monsters/i.test(s)) return true;
-  if (/^Damage/i.test(s)) return true;
-  if (/^Healing/i.test(s)) return true;
-  if (/^(Market|NPC|Custom)$/i.test(s)) return true;
-  return false;
-}
-
-/**
- * Party analyzer parser: only used for roster + supplies + (optional) balances.
- * For our corrected logic, supplies are mandatory.
- */
+// ===== Party analyzer parser =====
 export function parsePartyAnalyzerText(text) {
   const whole = String(text ?? "").replace(/\r\n/g, "\n");
   const lines = whole.split("\n").map(l => l.replace(/\t/g, "    ").trimEnd());
@@ -78,13 +83,11 @@ export function parsePartyAnalyzerText(text) {
     const headerRaw = lines[i].trim();
     if (isNonPlayerHeading(headerRaw)) continue;
 
-    const isLeader = /\(Leader\)/i.test(headerRaw);
-    const nameClean = stripLeadingJunkName(headerRaw.replace(/\(Leader\)/i, ""));
+    const nameClean = stripLeadingJunkName(headerRaw);
     if (!nameClean) continue;
     if (/^(Loot|Supplies|Balance)$/i.test(nameClean)) continue;
 
     let supplies = null;
-    let balance = null;
 
     for (let j = i + 1; j < Math.min(i + 12, lines.length); j++) {
       const t = lines[j].trim();
@@ -92,30 +95,22 @@ export function parsePartyAnalyzerText(text) {
       const mSup = t.match(/^Supplies:\s*([-\d,]+)/i);
       if (mSup) supplies = parseIntComma(mSup[1]);
 
-      const mBal = t.match(/^Balance:\s*([-\d,]+)/i);
-      if (mBal) balance = parseIntComma(mBal[1]);
-
-      // stop if next player header begins
       if (j > i + 1 && !t.includes(":") && !isNonPlayerHeading(t)) break;
     }
 
-    if (Number.isFinite(supplies)) {
-      players.push({ name: nameClean, isLeader, supplies, balance });
-    }
+    if (Number.isFinite(supplies)) players.push({ name: nameClean, supplies });
   }
 
   return { players };
 }
 
-/**
- * Looter analyzer parser: "Looted Items:" block.
- */
+// ===== Looter analyzer parser =====
 export function parseLooterAnalyzerText(text) {
   const whole = String(text ?? "");
   const items = [];
   const lines = whole.replace(/\r\n/g, "\n").split("\n");
 
-  let idx = lines.findIndex(l => /^Looted Items:/i.test(l.trim()));
+  const idx = lines.findIndex(l => /^Looted Items:/i.test(l.trim()));
   if (idx >= 0) {
     for (let i = idx + 1; i < lines.length; i++) {
       const trimmed = lines[i].trim();
@@ -130,32 +125,19 @@ export function parseLooterAnalyzerText(text) {
 
       items.push({ name: normalizeLootItemName(m[2]), qty });
     }
-  } else {
-    // Fallback if pasted in one line
-    const mBlock = whole.match(/Looted Items:\s*(.+)$/i);
-    if (mBlock) {
-      const tail = mBlock[1];
-      const re = /(\d+)\s*x\s+([^0-9]+?)(?=(\s+\d+\s*x\s+)|$)/gi;
-      let mm;
-      while ((mm = re.exec(tail)) !== null) {
-        const qty = Number(mm[1]);
-        const nameRaw = (mm[2] ?? "").trim();
-        if (!qty || !nameRaw) continue;
-        items.push({ name: normalizeLootItemName(nameRaw), qty });
-      }
-    }
   }
 
   return { items };
 }
 
 /**
- * Core requirement:
- * - Total loot is recalculated from looted items using max(Market BUY, NPC BUY).
- * - Coins have fixed value.
- * - Supplies are repaid, remaining profit split equally.
- * - Output direct payer->receiver transfers (no cash holder).
- * - Output per-player sell instructions (Market BUY vs NPC BUY).
+ * Market valuation rule:
+ * - For settlement: value per item = max(instant market liquidation via BUY depth, NPC BUY).
+ * - If BUY depth cannot fill entire qty, remaining is valued at next levels; if still unfilled -> 0 for remainder.
+ * - Coins: fixed values.
+ *
+ * Additional guidance:
+ * - If market chosen: show "instant sell expected" and also "suggested offer price" = BUY (instant) + optionally SELL (list).
  */
 export async function computeCorrectedSettlementSecura({ party, lootersByName }) {
   if (!party?.players?.length) throw new Error("Party analyzer missing or no players parsed.");
@@ -168,13 +150,15 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
   const n = roster.length;
   if (n <= 0) throw new Error("No players in party.");
 
-  // Require looter input for everyone (even None) so totals are deterministic
   const missing = roster.filter(p => !lootersByName.has(p.name)).map(p => p.name);
   if (missing.length) {
     throw new Error(`Missing looter paste for: ${missing.join(", ")} (paste even if "Looted Items: None")`);
   }
 
-  // Build unique item list for one market snapshot call
+  // One snapshot for buy/sell offers + month averages etc (from raw)
+  const snap = await fetchMarketSnapshotSecura();
+
+  // Resolve item IDs for all unique names
   const uniqueNames = new Set();
   for (const p of roster) {
     const items = lootersByName.get(p.name) ?? [];
@@ -182,16 +166,13 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
   }
   const itemNames = [...uniqueNames];
 
-  const snap = await fetchMarketSnapshotSecura(itemNames);
-
-  // Decide valuation route per item name
-  const itemDecision = new Map(); // nameNorm -> {route, unit, marketBuy, npcBuy}
+  const itemInfo = new Map(); // nameNorm -> {id, npcBuy, npcBuyers, snapRow}
   const unmatchedItemNames = [];
 
   for (const nm of itemNames) {
     const coin = fixedCoinValue(nm);
     if (coin != null) {
-      itemDecision.set(nm, { route: "COIN", unit: coin, marketBuy: coin, npcBuy: coin });
+      itemInfo.set(nm, { id: null, npcBuy: coin, npcBuyers: [], snapRow: null, isCoin: true });
       continue;
     }
 
@@ -201,14 +182,11 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
       continue;
     }
 
-    const npcBuy = await getNpcBuyById(id);           // SELL TO NPC price
-    const marketBuy = snap.items.get(nm)?.buy ?? null; // Market BUY offer
-    const buyVal = marketBuy != null ? marketBuy : 0;
+    const npcBuy = await getNpcBuyById(id);
+    const npcBuyers = await getNpcBuyersById(id);
 
-    const unit = Math.max(buyVal, npcBuy);
-    const route = buyVal > npcBuy ? "BUY" : "NPC";
-
-    itemDecision.set(nm, { route, unit, marketBuy, npcBuy });
+    const snapRow = snap.items.get(nm)?.raw ?? null;
+    itemInfo.set(nm, { id, npcBuy, npcBuyers, snapRow, isCoin: false });
   }
 
   // Per-player valuation and sell instructions
@@ -228,43 +206,84 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
     let heldLootValue = 0;
 
-    const sellBuy = [];
+    const sellMarket = [];
     const sellNpc = [];
     const unmatched = [];
 
     for (const [nameNorm, qty] of qtyByName.entries()) {
-      const dec = itemDecision.get(nameNorm);
-      if (!dec) {
+      const info = itemInfo.get(nameNorm);
+
+      if (!info) {
         unmatched.push({ name: nameNorm, qty });
         continue;
       }
 
-      // Coins: count value but do not put into "sell" lists
-      if (dec.route === "COIN") {
-        heldLootValue += qty * dec.unit;
+      // Coins
+      if (info.isCoin) {
+        heldLootValue += qty * info.npcBuy;
         continue;
       }
 
-      const unitValue = dec.unit;
-      heldLootValue += qty * unitValue;
+      const { id, npcBuy, npcBuyers, snapRow } = info;
+
+      // Instant market liquidation using depth (buyers)
+      let depth = null;
+      let marketInstantValue = 0;
+      let usedLevels = [];
+      try {
+        // Only fetch depth when it actually matters:
+        // - qty >= 10 OR npcBuy close to market OR you want accurate settlement
+        // For now: always for non-coins (correctness).
+        depth = await fetchMarketBoard("Secura", id);
+        const r = computeInstantSellValueFromBoard(depth, qty);
+        marketInstantValue = r.value;
+        usedLevels = r.usedLevels;
+      } catch {
+        // fallback to top-of-book if depth fails
+        const buyOffer = Number(snapRow?.buy_offer ?? 0);
+        marketInstantValue = Math.max(0, buyOffer) * qty;
+      }
+
+      const npcValue = (npcBuy || 0) * qty;
+
+      // Choose best liquidation
+      const chooseMarket = marketInstantValue > npcValue;
+      const chosenValue = Math.max(marketInstantValue, npcValue);
+      heldLootValue += chosenValue;
+
+      // Offer guidance
+      const buyOffer = Number(snapRow?.buy_offer ?? 0);
+      const sellOffer = Number(snapRow?.sell_offer ?? 0);
+      const monthAvgBuy = Number(snapRow?.month_average_buy ?? 0);
+      const monthAvgSell = Number(snapRow?.month_average_sell ?? 0);
+
+      const bestNpc = npcBuyers?.[0]?.name ? `${npcBuyers[0].name} (${npcBuyers[0].price})` : "";
 
       const row = {
         name: nameNorm,
         qty,
-        marketBuy: dec.marketBuy ?? 0,
-        npcBuy: dec.npcBuy ?? 0,
-        unit: unitValue,
-        total: qty * unitValue
+        itemId: id,
+        chosen: chooseMarket ? "MARKET_BUY_DEPTH" : "NPC",
+        chosenTotal: chosenValue,
+        marketInstantTotal: marketInstantValue,
+        npcTotal: npcValue,
+        buyOffer,
+        sellOffer,
+        monthAvgBuy,
+        monthAvgSell,
+        npcBuy,
+        bestNpc,
+        usedLevels // for depth explanation
       };
 
-      if (dec.route === "BUY") sellBuy.push(row);
+      if (chooseMarket) sellMarket.push(row);
       else sellNpc.push(row);
     }
 
-    sellBuy.sort((a, b) => b.total - a.total);
-    sellNpc.sort((a, b) => b.total - a.total);
+    sellMarket.sort((a, b) => b.chosenTotal - a.chosenTotal);
+    sellNpc.sort((a, b) => b.chosenTotal - a.chosenTotal);
 
-    sellInstructionsByPlayer.set(p.name, { sellBuy, sellNpc, unmatched });
+    sellInstructionsByPlayer.set(p.name, { sellMarket, sellNpc, unmatched });
 
     totalSupplies += p.supplies;
     totalHeldLoot += heldLootValue;
@@ -279,7 +298,7 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
   const correctedNet = totalHeldLoot - totalSupplies;
   const share = Math.floor(correctedNet / n);
 
-  // Fair payout for each player = supplies repaid + equal share of net
+  // fair payout = supplies refunded + equal profit share
   const payers = [];
   const receivers = [];
 
@@ -294,7 +313,7 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
     if (delta < 0) receivers.push({ name: p.name, amt: -delta });
   }
 
-  // Generate transfers payer -> receiver
+  // payer -> receiver transfers
   const transfers = [];
   let i = 0, j = 0;
   while (i < payers.length && j < receivers.length) {
