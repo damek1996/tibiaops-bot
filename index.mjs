@@ -23,6 +23,14 @@ function truncate(s, max = 1800) {
   return str.length > max ? str.slice(0, max - 3) + "..." : str;
 }
 
+function gp(n) {
+  return `${fmtInt(n)} gp`;
+}
+
+function monospaceBlock(lines) {
+  return "```text\n" + lines.join("\n") + "\n```";
+}
+
 async function readInputTextFromInteraction(interaction, textOptionName, fileOptionName) {
   const text = interaction.options.getString(textOptionName, false);
   const file = interaction.options.getAttachment(fileOptionName, false);
@@ -38,6 +46,23 @@ async function readInputTextFromInteraction(interaction, textOptionName, fileOpt
   throw new Error("Provide either text OR attach a .txt file.");
 }
 
+function groupTransfersByPayer(transfers) {
+  const m = new Map(); // payer -> [{to, amount}]
+  for (const t of transfers) {
+    if (!m.has(t.from)) m.set(t.from, []);
+    m.get(t.from).push({ to: t.to, amount: t.amount });
+  }
+  for (const [k, arr] of m.entries()) {
+    arr.sort((a, b) => b.amount - a.amount);
+    m.set(k, arr);
+  }
+  return m;
+}
+
+function topRows(rows, max = 8) {
+  return (rows ?? []).slice(0, max);
+}
+
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -50,14 +75,15 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
       }
 
-      return interaction.reply({
-        content:
-          `**Secura — ${item}**\n` +
-          `BUY offer: **${p.buy != null ? formatGold(p.buy) : "n/a"} gp**\n` +
-          `SELL offer: **${p.sell != null ? formatGold(p.sell) : "n/a"} gp**\n` +
-          `Updated: ${p.updatedAt.toISOString()}`,
-        ephemeral: true
-      });
+      const embed = new EmbedBuilder()
+        .setTitle(`💱 Price — ${item} (Secura)`)
+        .setDescription(`Snapshot: ${p.updatedAt.toISOString()}`)
+        .addFields(
+          { name: "Market BUY offer", value: p.buy != null ? `**${formatGold(p.buy)} gp**` : "**n/a**", inline: true },
+          { name: "Market SELL offer", value: p.sell != null ? `**${formatGold(p.sell)} gp**` : "**n/a**", inline: true }
+        );
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
     } catch (e) {
       return interaction.reply({ content: `Price check failed: ${e.message}`, ephemeral: true });
     }
@@ -71,14 +97,16 @@ client.on("interactionCreate", async interaction => {
     const world = interaction.options.getString("world") ?? "Secura";
     sessions.set(interaction.channelId, { world, party: null, lootersByName: new Map() });
 
-    return interaction.reply({
-      content:
-        `Settlement started for **${world}**.\n` +
-        `1) /settle party (paste or attach .txt)\n` +
-        `2) Each player: /settle looter name:<exact party name> (paste or attach .txt)\n` +
-        `3) /settle done`,
-      ephemeral: false
-    });
+    const embed = new EmbedBuilder()
+      .setTitle("🧾 Settlement started")
+      .setDescription(
+        `World: **${world}**\n\n` +
+        `1) Use **/settle party** (paste or attach .txt)\n` +
+        `2) Each player uses **/settle looter** (paste or attach .txt)\n` +
+        `3) Run **/settle done**`
+      );
+
+    return interaction.reply({ embeds: [embed], ephemeral: false });
   }
 
   if (sub === "party") {
@@ -105,14 +133,17 @@ client.on("interactionCreate", async interaction => {
       sess.party = party;
 
       const names = party.players.map(p => p.name).join(", ");
-      return interaction.reply({
-        content:
-          `Party loaded. Players: **${party.players.length}**\n` +
-          `Detected: ${names}\n\n` +
-          `Now each player paste/attach their analyzer (even if Looted Items: None):\n` +
-          `Use: /settle looter name:<exact name>`,
-        ephemeral: false
-      });
+      const embed = new EmbedBuilder()
+        .setTitle("👥 Party loaded")
+        .setDescription(`Players (**${party.players.length}**):\n${names}`)
+        .addFields({
+          name: "Next",
+          value:
+            `Each player paste/attach their analyzer (even if **Looted Items: None**):\n` +
+            `Use: **/settle looter name:<exact name>**`
+        });
+
+      return interaction.reply({ embeds: [embed], ephemeral: false });
     } catch (e) {
       return interaction.reply({ content: `Party load failed: ${e.message}`, ephemeral: true });
     }
@@ -139,10 +170,13 @@ client.on("interactionCreate", async interaction => {
       const parsed = parseLooterAnalyzerText(looterText);
 
       sess.lootersByName.set(match.name, parsed.items ?? []);
-      return interaction.reply({
-        content: `Captured looter analyzer for **${match.name}**. Items parsed: **${(parsed.items ?? []).length}**.`,
-        ephemeral: false
-      });
+
+      const embed = new EmbedBuilder()
+        .setTitle("📦 Looter captured")
+        .setDescription(`Player: **${match.name}**`)
+        .addFields({ name: "Items parsed", value: `**${(parsed.items ?? []).length}**`, inline: true });
+
+      return interaction.reply({ embeds: [embed], ephemeral: false });
     } catch (e) {
       return interaction.reply({ content: `Looter load failed: ${e.message}`, ephemeral: true });
     }
@@ -170,56 +204,94 @@ client.on("interactionCreate", async interaction => {
       const nPlayers = result.perPlayer.length;
       const remainder = result.correctedNet - (result.share * nPlayers);
 
-      const transfersText = result.transfers.length
-        ? result.transfers.map(t => `• **${t.from}** → **${t.to}**: **${fmtInt(t.amount)} gp**`).join("\n")
-        : "No transfers needed.";
-
-      const perPlayerLines = result.perPlayer
-        .map(p =>
-          `• **${p.name}** held ${fmtInt(p.heldLootValue)} | supplies ${fmtInt(p.supplies)} | fair payout ${fmtInt(p.fairPayout)} | profit ${fmtInt(result.share)} | delta ${fmtInt(p.delta)}`
-        )
-        .join("\n");
-
-      const embed = new EmbedBuilder()
-        .setTitle("Hunt Settlement — Corrected Loot (Market BUY vs NPC BUY) + Equal Split")
-        .setDescription(`World: Secura | Market snapshot: ${result.updatedAt.toISOString()}`)
+      // Summary embed
+      const summary = new EmbedBuilder()
+        .setTitle("✅ Settlement complete — Corrected loot + Equal split")
+        .setDescription(`World: **Secura** • Snapshot: ${result.updatedAt.toISOString()}`)
         .addFields(
           {
-            name: "Totals",
+            name: "💰 Totals",
             value:
               `Players: **${nPlayers}**\n` +
-              `Corrected total loot (best liquidation): **${fmtInt(result.totalHeldLoot)} gp**\n` +
-              `Total supplies: **${fmtInt(result.totalSupplies)} gp**\n` +
-              `Corrected net profit: **${fmtInt(result.correctedNet)} gp**\n` +
-              `Profit per player (equal): **${fmtInt(result.share)} gp**\n` +
-              `Remainder (due to rounding): **${fmtInt(remainder)} gp**`
-          },
-          { name: "Per-player accounting", value: truncate(perPlayerLines, 1024) },
-          { name: "Transfers (who sends who)", value: truncate(transfersText, 1024) }
+              `Corrected loot: **${gp(result.totalHeldLoot)}**\n` +
+              `Supplies: **${gp(result.totalSupplies)}**\n` +
+              `Net profit: **${gp(result.correctedNet)}**\n` +
+              `Profit per player: **${gp(result.share)}**\n` +
+              `Remainder: **${gp(remainder)}**`
+          }
         );
 
-      await interaction.reply({ embeds: [embed] });
+      const accountingLines = result.perPlayer
+        .map(p => {
+          const sign = p.delta >= 0 ? "+" : "-";
+          return `${p.name.padEnd(16)} held ${fmtInt(p.heldLootValue).padStart(10)} | sup ${fmtInt(p.supplies).padStart(9)} | payout ${fmtInt(p.fairPayout).padStart(10)} | delta ${sign}${fmtInt(Math.abs(p.delta)).padStart(10)}`;
+        });
 
-      // Follow-ups: sell instructions per player
+      summary.addFields({
+        name: "🧮 Per-player accounting (held vs fair payout)",
+        value: monospaceBlock(truncate(accountingLines.join("\n"), 900).split("\n"))
+      });
+
+      await interaction.reply({ embeds: [summary] });
+
+      // Transfers embed
+      const transfersMap = groupTransfersByPayer(result.transfers);
+      const transferLines = [];
+
+      if (result.transfers.length === 0) {
+        transferLines.push("No transfers needed.");
+      } else {
+        for (const [payer, arr] of transfersMap.entries()) {
+          transferLines.push(`${payer}:`);
+          for (const x of arr) {
+            transferLines.push(`  -> ${x.to}: ${fmtInt(x.amount)} gp`);
+          }
+          transferLines.push("");
+        }
+      }
+
+      const transfersEmbed = new EmbedBuilder()
+        .setTitle("🏦 Transfers (who sends who)")
+        .setDescription(monospaceBlock(truncate(transferLines.join("\n"), 1800).split("\n")));
+
+      await interaction.followUp({ embeds: [transfersEmbed] });
+
+      // Sell embeds per player
       for (const p of result.perPlayer) {
         const ins = result.sellInstructionsByPlayer.get(p.name) || { sellBuy: [], sellNpc: [], unmatched: [] };
 
-        const buyList = ins.sellBuy.length
-          ? ins.sellBuy.slice(0, 30).map(x => `- ${x.qty}x ${x.name} (BUY ${fmtInt(x.marketBuy)} | NPC ${fmtInt(x.npcBuy)})`).join("\n")
-          : "- None";
+        const buyTop = topRows(ins.sellBuy, 10);
+        const npcTop = topRows(ins.sellNpc, 10);
 
-        const npcList = ins.sellNpc.length
-          ? ins.sellNpc.slice(0, 30).map(x => `- ${x.qty}x ${x.name} (NPC ${fmtInt(x.npcBuy)} | BUY ${fmtInt(x.marketBuy)})`).join("\n")
-          : "- None";
+        const buyLines = buyTop.length
+          ? buyTop.map(x => `${String(x.qty).padStart(4)}x ${x.name.padEnd(28)} | BUY ${fmtInt(x.marketBuy).padStart(8)} | NPC ${fmtInt(x.npcBuy).padStart(8)}`)
+          : ["(none)"];
 
-        const msg =
-          `**Sell instructions — ${p.name}**\n` +
-          `**Sell on Market (BUY offer):**\n` +
-          "```text\n" + truncate(buyList, 1800) + "\n```\n" +
-          `**Sell to NPC:**\n` +
-          "```text\n" + truncate(npcList, 1800) + "\n```";
+        const npcLines = npcTop.length
+          ? npcTop.map(x => `${String(x.qty).padStart(4)}x ${x.name.padEnd(28)} | NPC ${fmtInt(x.npcBuy).padStart(8)} | BUY ${fmtInt(x.marketBuy).padStart(8)}`)
+          : ["(none)"];
 
-        await interaction.followUp({ content: msg });
+        const unmatchedLines = (ins.unmatched && ins.unmatched.length)
+          ? ins.unmatched.slice(0, 10).map(x => `${x.qty}x ${x.name}`)
+          : [];
+
+        const embed = new EmbedBuilder()
+          .setTitle(`🧺 Sell instructions — ${p.name}`)
+          .setDescription("Rule: value per item = max(Market BUY, NPC BUY).")
+          .addFields(
+            { name: "🟦 Sell on Market (BUY offer) — top items", value: monospaceBlock(buyLines), inline: false },
+            { name: "🟨 Sell to NPC — top items", value: monospaceBlock(npcLines), inline: false }
+          );
+
+        if (unmatchedLines.length) {
+          embed.addFields({
+            name: "⚠️ Unmatched items (name not found in metadata)",
+            value: monospaceBlock(unmatchedLines),
+            inline: false
+          });
+        }
+
+        await interaction.followUp({ embeds: [embed] });
       }
 
       sessions.delete(interaction.channelId);
