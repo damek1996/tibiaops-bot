@@ -17,26 +17,15 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-// channelId -> { world, party, lootersByName: Map(playerName -> items[]), pendingLooterSelection: Map(userId -> name) }
+// channelId -> settlement session state during collection
 const sessions = new Map();
+
+// channelId -> { createdAtMs, players: string[], sellInstructionsByPlayer: Map(name -> instr) }
+const instructionBoards = new Map();
+const INSTRUCTION_TTL_MS = 30 * 60 * 1000;
 
 function fmtInt(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
-}
-
-function chunkLinesToMessages(lines, maxChars = 1800) {
-  const chunks = [];
-  let cur = "";
-  for (const line of lines) {
-    // +1 for newline
-    if ((cur.length + line.length + 1) > maxChars) {
-      if (cur.trim().length) chunks.push(cur);
-      cur = "";
-    }
-    cur += (cur.length ? "\n" : "") + line;
-  }
-  if (cur.trim().length) chunks.push(cur);
-  return chunks;
 }
 
 async function readInputText(interaction) {
@@ -76,50 +65,98 @@ function buildLooterSelect(sess) {
   );
 }
 
-function formatPlayerInstructions(playerName, instr) {
-  // Compact + includes per-item prices
+function purgeOldBoards() {
+  const now = Date.now();
+  for (const [channelId, b] of instructionBoards.entries()) {
+    if (!b?.createdAtMs || (now - b.createdAtMs) > INSTRUCTION_TTL_MS) instructionBoards.delete(channelId);
+  }
+}
+
+function buildInstructionSelect(channelId, players, selected = null) {
+  const options = players.slice(0, 25).map(name => ({
+    label: name,
+    value: `${channelId}::${name}`,
+    default: selected === name
+  }));
+
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("settle_instructions_select")
+      .setPlaceholder("Pick a player to view sell instructions…")
+      .setMinValues(1)
+      .setMaxValues(1)
+      .addOptions(options)
+  );
+}
+
+function renderInstructions(playerName, instr) {
   const lines = [];
-  lines.push(`Hunt Sell Instructions — ${playerName}`);
+  lines.push(`Sell Instructions — ${playerName}`);
   lines.push("");
 
   lines.push("SELL ON MARKET (highest BUY offer):");
-  if (!instr.sellMarket?.length) {
-    lines.push("• none");
-  } else {
-    for (const r of instr.sellMarket) {
-      lines.push(
-        `• ${r.qty}x ${r.name} | BUY ${fmtInt(r.buyOffer)} ea | total ${fmtInt(r.marketTotal)} gp`
-      );
+  if (!instr.sellMarket?.length) lines.push("• none");
+  else {
+    for (const r of instr.sellMarket.slice(0, 35)) {
+      lines.push(`• ${r.qty}x ${r.name} | BUY ${fmtInt(r.buyOffer)} ea | total ${fmtInt(r.marketTotal)} gp`);
     }
+    if (instr.sellMarket.length > 35) lines.push(`…and ${instr.sellMarket.length - 35} more`);
   }
 
   lines.push("");
   lines.push("SELL TO NPC (best buyer):");
-  if (!instr.sellNpc?.length) {
-    lines.push("• none");
-  } else {
-    for (const r of instr.sellNpc) {
+  if (!instr.sellNpc?.length) lines.push("• none");
+  else {
+    for (const r of instr.sellNpc.slice(0, 35)) {
       const npcInfo = r.bestNpc ? ` | NPC ${r.bestNpc}` : "";
-      lines.push(
-        `• ${r.qty}x ${r.name} | NPC ${fmtInt(r.npcBuy)} ea | total ${fmtInt(r.npcTotal)} gp${npcInfo}`
-      );
+      lines.push(`• ${r.qty}x ${r.name} | NPC ${fmtInt(r.npcBuy)} ea | total ${fmtInt(r.npcTotal)} gp${npcInfo}`);
     }
+    if (instr.sellNpc.length > 35) lines.push(`…and ${instr.sellNpc.length - 35} more`);
   }
 
   if (instr.unmatched?.length) {
     lines.push("");
     lines.push("UNMATCHED (not priced):");
-    for (const u of instr.unmatched) lines.push(`• ${u.qty}x ${u.name}`);
+    for (const u of instr.unmatched.slice(0, 25)) lines.push(`• ${u.qty}x ${u.name}`);
+    if (instr.unmatched.length > 25) lines.push(`…and ${instr.unmatched.length - 25} more`);
   }
 
-  // turn into chunked codeblocks
-  const chunks = chunkLinesToMessages(lines, 1700);
-  return chunks.map(c => "```text\n" + c + "\n```");
+  // keep under 1900 chars
+  let out = lines.join("\n");
+  if (out.length > 1800) out = out.slice(0, 1800) + "\n…(truncated)";
+  return "```text\n" + out + "\n```";
 }
 
 client.on("interactionCreate", async interaction => {
   try {
-    // Dropdown selection handler
+    purgeOldBoards();
+
+    // Instructions dropdown handler
+    if (interaction.isStringSelectMenu() && interaction.customId === "settle_instructions_select") {
+      const pick = interaction.values?.[0] ?? "";
+      const [channelId, playerName] = pick.split("::");
+      if (!channelId || !playerName) {
+        return interaction.reply({ ephemeral: true, content: "Invalid selection." });
+      }
+
+      const board = instructionBoards.get(channelId);
+      if (!board) {
+        return interaction.reply({ ephemeral: true, content: "Instruction board expired. Run /settle done again." });
+      }
+
+      const instr = board.sellInstructionsByPlayer.get(playerName);
+      if (!instr) {
+        return interaction.reply({ ephemeral: true, content: `No instruction data for ${playerName}.` });
+      }
+
+      const content = renderInstructions(playerName, instr);
+      const row = buildInstructionSelect(channelId, board.players, playerName);
+
+      // Edit the same message (clean UX)
+      return interaction.update({ content, components: [row] });
+    }
+
+    // Looter dropdown handler
     if (interaction.isStringSelectMenu() && interaction.customId === "settle_looter_select") {
       const sess = sessions.get(interaction.channelId);
       if (!sess?.party) {
@@ -205,12 +242,9 @@ client.on("interactionCreate", async interaction => {
         sess.pendingLooterSelection.clear();
 
         const names = party.players.map(p => `${p.name} (supplies ${fmtInt(p.supplies)})`).join("\n");
-
         return interaction.reply({
           ephemeral: false,
-          content:
-            `Party loaded. Players: **${party.players.length}**\n` +
-            "```text\n" + names + "\n```"
+          content: `Party loaded. Players: **${party.players.length}**\n` + "```text\n" + names + "\n```"
         });
       } catch (e) {
         return interaction.reply({ content: `Party load failed: ${e.message}`, ephemeral: true });
@@ -306,30 +340,26 @@ client.on("interactionCreate", async interaction => {
           await interaction.followUp("```text\nTransfers (who sends who)\n" + t + "\n```");
         }
 
-        // Sanity summary so you can confirm instruction generation ran
-        const instrPlayers = [...result.sellInstructionsByPlayer.keys()].length;
-        let marketItems = 0;
-        let npcItems = 0;
-        for (const v of result.sellInstructionsByPlayer.values()) {
-          marketItems += (v.sellMarket?.length ?? 0);
-          npcItems += (v.sellNpc?.length ?? 0);
-        }
-        await interaction.followUp(
-          "```text\n" +
-          `Instruction summary: players=${instrPlayers}, market-items=${marketItems}, npc-items=${npcItems}\n` +
-          "```"
-        );
+        // Save instruction board for dropdown rendering
+        const players = result.perPlayer.map(p => p.name);
+        instructionBoards.set(interaction.channelId, {
+          createdAtMs: Date.now(),
+          players,
+          sellInstructionsByPlayer: result.sellInstructionsByPlayer
+        });
 
-        // Sell instructions per player (chunked)
-        for (const p of result.perPlayer) {
-          const instr = result.sellInstructionsByPlayer.get(p.name);
-          if (!instr) continue;
+        const first = players[0];
+        const firstInstr = result.sellInstructionsByPlayer.get(first);
 
-          const msgs = formatPlayerInstructions(p.name, instr);
-          for (const m of msgs) {
-            await interaction.followUp(m);
-          }
-        }
+        const row = buildInstructionSelect(interaction.channelId, players, first);
+        const content = firstInstr
+          ? renderInstructions(first, firstInstr)
+          : "No instructions available.";
+
+        await interaction.followUp({
+          content,
+          components: [row]
+        });
 
         sessions.delete(interaction.channelId);
       } catch (e) {
