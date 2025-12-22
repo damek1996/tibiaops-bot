@@ -3,8 +3,9 @@ import "dotenv/config";
 export const TIBIA_MARKET_BASE_URL =
   process.env.TIBIA_MARKET_BASE_URL?.trim() || "https://api.tibiamarket.top";
 
-// API limit: 1 request / 5 seconds
-const RATE_LIMIT_MS = 5200;
+// market_values is typically more permissive than market_board.
+// We'll still throttle conservatively.
+const RATE_LIMIT_MS = 1200; // ~1 req / 1.2s
 
 let lastRequestAt = 0;
 async function throttle() {
@@ -26,10 +27,18 @@ export function formatGold(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, attempt = 1) {
   await throttle();
   const res = await fetch(url, { headers: { accept: "application/json" } });
   const text = await res.text();
+
+  // Basic backoff on 429
+  if (res.status === 429 && attempt <= 5) {
+    const delay = 1500 * attempt;
+    await new Promise(r => setTimeout(r, delay));
+    return fetchJson(url, attempt + 1);
+  }
+
   if (!res.ok) throw new Error(`API ${res.status} for ${url}: ${text}`);
   try {
     return JSON.parse(text);
@@ -44,7 +53,7 @@ let metadataLoadedAt = 0;
 
 export async function loadItemMetadata() {
   const now = Date.now();
-  if (metadataCache && (now - metadataLoadedAt) < 6 * 60 * 60 * 1000) return metadataCache;
+  if (metadataCache && (now - metadataLoadedAt) < 24 * 60 * 60 * 1000) return metadataCache;
 
   const url = `${TIBIA_MARKET_BASE_URL}/item_metadata`;
   const arr = await fetchJson(url);
@@ -83,80 +92,63 @@ export async function getBestNpcBuyPrice(itemId) {
   return buyers[0]?.price ?? 0;
 }
 
-// ---- Market board (depth) ----
-const marketBoardCache = new Map(); // key `${server}:${id}` -> {board, loadedAt}
+// ---- market_values (bulk) ----
+const marketValuesCache = new Map(); // key `${server}:${id}` -> { buy_offer, timeMs }
 
-export function computeInstantSellValueFromBoard(board, qty) {
-  const buyers = Array.isArray(board?.buyers) ? board.buyers : [];
-  if (!buyers.length) return { value: 0, filled: 0, remaining: qty, usedLevels: [] };
+export async function fetchMarketBuyOffers(server, itemIds) {
+  const now = Date.now();
+  const out = new Map();
 
-  const levels = buyers
-    .map(x => ({
-      price: Number(x?.price ?? 0),
-      amount: Number(x?.amount ?? 0),
-      time: Number(x?.time ?? 0)
-    }))
-    .filter(x => Number.isFinite(x.price) && x.price > 0 && Number.isFinite(x.amount) && x.amount > 0)
-    .sort((a, b) => (b.price - a.price) || (b.time - a.time));
+  // return cached where fresh
+  const need = [];
+  for (const id of itemIds) {
+    const key = `${server}:${id}`;
+    const c = marketValuesCache.get(key);
+    if (c && (now - c.timeMs) < 60 * 1000) out.set(id, c.buy_offer);
+    else need.push(id);
+  }
+  if (!need.length) return out;
 
-  let remaining = qty;
-  let value = 0;
-  const usedLevels = [];
+  // chunk item_ids
+  const CHUNK = 100;
+  for (let i = 0; i < need.length; i += CHUNK) {
+    const chunk = need.slice(i, i + CHUNK);
+    const url =
+      `${TIBIA_MARKET_BASE_URL}/market_values` +
+      `?server=${encodeURIComponent(server)}` +
+      `&item_ids=${encodeURIComponent(chunk.join(","))}` +
+      `&skip=0&limit=${chunk.length}`;
 
-  for (const lvl of levels) {
-    if (remaining <= 0) break;
-    const take = Math.min(remaining, lvl.amount);
-    if (take <= 0) continue;
-    value += take * lvl.price;
-    usedLevels.push({ price: lvl.price, amount: take });
-    remaining -= take;
+    const arr = await fetchJson(url);
+    if (!Array.isArray(arr)) throw new Error("market_values did not return an array");
+
+    for (const row of arr) {
+      const id = Number(row?.id);
+      if (!Number.isFinite(id)) continue;
+
+      const buy_offer = Number(row?.buy_offer ?? 0);
+      const key = `${server}:${id}`;
+      marketValuesCache.set(key, { buy_offer: Number.isFinite(buy_offer) ? buy_offer : 0, timeMs: Date.now() });
+      out.set(id, Number.isFinite(buy_offer) ? buy_offer : 0);
+    }
   }
 
-  return { value, filled: qty - remaining, remaining, usedLevels };
+  // ensure all requested ids present
+  for (const id of need) if (!out.has(id)) out.set(id, 0);
+
+  return out;
 }
 
-function topPriceFromSide(sideArr, descending = true) {
-  const arr = Array.isArray(sideArr) ? sideArr : [];
-  const levels = arr
-    .map(x => ({ price: Number(x?.price ?? 0), amount: Number(x?.amount ?? 0), time: Number(x?.time ?? 0) }))
-    .filter(x => Number.isFinite(x.price) && x.price > 0 && Number.isFinite(x.amount) && x.amount > 0)
-    .sort((a, b) => {
-      if (descending) return (b.price - a.price) || (b.time - a.time);
-      return (a.price - b.price) || (b.time - a.time);
-    });
-  return levels[0]?.price ?? 0;
-}
-
-// IMPORTANT: market_board requires a SINGLE item_id (not item_ids)
-export async function fetchMarketBoard(server, itemId) {
-  const key = `${server}:${itemId}`;
-  const now = Date.now();
-
-  const c = marketBoardCache.get(key);
-  if (c && (now - c.loadedAt) < 60 * 1000) return c.board;
-
-  const url =
-    `${TIBIA_MARKET_BASE_URL}/market_board` +
-    `?server=${encodeURIComponent(server)}` +
-    `&item_id=${encodeURIComponent(itemId)}`;
-
-  const board = await fetchJson(url);
-  marketBoardCache.set(key, { board, loadedAt: Date.now() });
-  return board;
-}
-
-// Used by /price command: top BUY + top SELL derived from board
+// /price command: show market BUY offer (from market_values) + NPC best buy
 export async function getPriceSecuraByName(itemName) {
   const nameNorm = normItemName(itemName);
   const id = await getItemIdByName(nameNorm);
   if (!Number.isFinite(id)) {
-    return { found: false, reason: "item not found in metadata", buy: null, sell: null, updatedAt: new Date() };
+    return { found: false, reason: "item not found in metadata", buy: null, npc: null, updatedAt: new Date() };
   }
 
-  const board = await fetchMarketBoard("Secura", id);
-  const buy = topPriceFromSide(board.buyers, true);     // highest buy
-  const sell = topPriceFromSide(board.sellers, false);  // lowest sell
-  const updatedAt = board.update_time ? new Date(Number(board.update_time) * 1000) : new Date();
-
-  return { found: true, buy, sell, updatedAt };
+  const offers = await fetchMarketBuyOffers("Secura", [id]);
+  const buy = offers.get(id) ?? 0;
+  const npc = await getBestNpcBuyPrice(id);
+  return { found: true, buy, npc, updatedAt: new Date() };
 }

@@ -3,8 +3,7 @@
   getItemIdByName,
   getBestNpcBuyPrice,
   getNpcBuyersById,
-  fetchMarketBoard,
-  computeInstantSellValueFromBoard
+  fetchMarketBuyOffers
 } from "./provider.mjs";
 
 function parseIntComma(s) {
@@ -124,7 +123,7 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
   const missing = roster.filter(p => !lootersByName.has(p.name)).map(p => p.name);
   if (missing.length) throw new Error(`Missing looter paste for: ${missing.join(", ")}`);
 
-  // resolve all unique items once
+  // Resolve IDs for all unique item names (once)
   const uniqueNames = new Set();
   for (const p of roster) {
     const items = lootersByName.get(p.name) ?? [];
@@ -133,13 +132,19 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
   const nameToId = new Map();
   const unmatchedItemNames = [];
+
   for (const nm of uniqueNames) {
     const coin = fixedCoinValue(nm);
     if (coin != null) continue;
+
     const id = await resolveItemId(nm);
     if (id == null) unmatchedItemNames.push(nm);
     else nameToId.set(nm, id);
   }
+
+  // Bulk fetch market BUY offers for all IDs
+  const allIds = [...new Set([...nameToId.values()])];
+  const marketBuyOffers = await fetchMarketBuyOffers("Secura", allIds);
 
   const perPlayer = [];
   const sellInstructionsByPlayer = new Map();
@@ -162,34 +167,40 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
     for (const [nameNorm, qty] of qtyByName.entries()) {
       const coinV = fixedCoinValue(nameNorm);
-      if (coinV != null) { heldLootValue += qty * coinV; continue; }
+      if (coinV != null) {
+        heldLootValue += qty * coinV;
+        continue;
+      }
 
       const id = nameToId.get(nameNorm);
-      if (!id) { unmatched.push({ name: nameNorm, qty }); continue; }
-
-      // market depth for THIS item
-      const board = await fetchMarketBoard("Secura", id);
-      const depth = computeInstantSellValueFromBoard(board, qty);
-      const marketInstantTotal = depth.value;
+      if (!id) {
+        unmatched.push({ name: nameNorm, qty });
+        continue;
+      }
 
       const npcBuy = await getBestNpcBuyPrice(id);
       const npcTotal = npcBuy * qty;
 
+      const buyOffer = marketBuyOffers.get(id) ?? 0;
+      const marketTotal = buyOffer * qty;
+
       const npcBuyers = await getNpcBuyersById(id);
       const bestNpc = npcBuyers?.[0]?.name ? `${npcBuyers[0].name} (${npcBuyers[0].price})` : "";
 
-      const chooseMarket = marketInstantTotal > npcTotal;
-      const chosenTotal = Math.max(marketInstantTotal, npcTotal);
+      const chooseMarket = marketTotal > npcTotal;
+      const chosenTotal = Math.max(marketTotal, npcTotal);
       heldLootValue += chosenTotal;
 
-      const topBuy = depth.usedLevels?.[0]?.price ?? 0;
-
       const row = {
-        name: nameNorm, qty, itemId: id,
-        chosenTotal, marketInstantTotal, npcTotal,
-        npcBuy, bestNpc,
-        usedLevels: depth.usedLevels ?? [],
-        topBuy
+        name: nameNorm,
+        qty,
+        itemId: id,
+        chosenTotal,
+        marketTotal,
+        buyOffer,
+        npcTotal,
+        npcBuy,
+        bestNpc
       };
 
       if (chooseMarket) sellMarket.push(row);
@@ -203,6 +214,7 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
     totalHeldLoot += heldLootValue;
     totalSupplies += p.supplies;
+
     perPlayer.push({ name: p.name, supplies: p.supplies, heldLootValue });
   }
 
@@ -211,6 +223,7 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
   const payers = [];
   const receivers = [];
+
   for (const p of perPlayer) {
     p.fairPayout = p.supplies + share;
     p.delta = p.heldLootValue - p.fairPayout;
