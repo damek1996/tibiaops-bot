@@ -127,51 +127,25 @@ function topPriceFromSide(sideArr, descending = true) {
   return levels[0]?.price ?? 0;
 }
 
-// Batch fetch boards for multiple IDs
-export async function fetchMarketBoards(server, itemIds) {
+// IMPORTANT: market_board requires a SINGLE item_id (not item_ids)
+export async function fetchMarketBoard(server, itemId) {
+  const key = `${server}:${itemId}`;
   const now = Date.now();
-  const out = new Map();
 
-  const missing = [];
-  for (const id of itemIds) {
-    const key = `${server}:${id}`;
-    const c = marketBoardCache.get(key);
-    if (c && (now - c.loadedAt) < 60 * 1000) out.set(id, c.board);
-    else missing.push(id);
-  }
-  if (!missing.length) return out;
+  const c = marketBoardCache.get(key);
+  if (c && (now - c.loadedAt) < 60 * 1000) return c.board;
 
-  const chunkSize = 50;
-  for (let i = 0; i < missing.length; i += chunkSize) {
-    const chunk = missing.slice(i, i + chunkSize);
+  const url =
+    `${TIBIA_MARKET_BASE_URL}/market_board` +
+    `?server=${encodeURIComponent(server)}` +
+    `&item_id=${encodeURIComponent(itemId)}`;
 
-    const url =
-      `${TIBIA_MARKET_BASE_URL}/market_board` +
-      `?server=${encodeURIComponent(server)}` +
-      `&item_ids=${encodeURIComponent(chunk.join(","))}`;
-
-    const data = await fetchJson(url);
-
-    if (Array.isArray(data)) {
-      for (const b of data) {
-        const id = Number(b?.id);
-        if (!Number.isFinite(id)) continue;
-        marketBoardCache.set(`${server}:${id}`, { board: b, loadedAt: Date.now() });
-        out.set(id, b);
-      }
-    } else if (data && typeof data === "object") {
-      const id = Number(data?.id);
-      if (Number.isFinite(id)) {
-        marketBoardCache.set(`${server}:${id}`, { board: data, loadedAt: Date.now() });
-        out.set(id, data);
-      }
-    }
-  }
-
-  return out;
+  const board = await fetchJson(url);
+  marketBoardCache.set(key, { board, loadedAt: Date.now() });
+  return board;
 }
 
-// Convenience: price check for a single item name on Secura using market_board
+// Used by /price command: top BUY + top SELL derived from board
 export async function getPriceSecuraByName(itemName) {
   const nameNorm = normItemName(itemName);
   const id = await getItemIdByName(nameNorm);
@@ -179,12 +153,7 @@ export async function getPriceSecuraByName(itemName) {
     return { found: false, reason: "item not found in metadata", buy: null, sell: null, updatedAt: new Date() };
   }
 
-  const boards = await fetchMarketBoards("Secura", [id]);
-  const board = boards.get(id);
-  if (!board) {
-    return { found: false, reason: "no board data", buy: null, sell: null, updatedAt: new Date() };
-  }
-
+  const board = await fetchMarketBoard("Secura", id);
   const buy = topPriceFromSide(board.buyers, true);     // highest buy
   const sell = topPriceFromSide(board.sellers, false);  // lowest sell
   const updatedAt = board.update_time ? new Date(Number(board.update_time) * 1000) : new Date();

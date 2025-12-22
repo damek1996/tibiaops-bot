@@ -3,11 +3,10 @@
   getItemIdByName,
   getBestNpcBuyPrice,
   getNpcBuyersById,
-  fetchMarketBoards,
+  fetchMarketBoard,
   computeInstantSellValueFromBoard
 } from "./provider.mjs";
 
-// ---------- helpers ----------
 function parseIntComma(s) {
   if (s == null) return null;
   const cleaned = String(s).replace(/,/g, "").trim();
@@ -18,7 +17,7 @@ function parseIntComma(s) {
 function cleanPlayerHeader(line) {
   return String(line ?? "")
     .replace(/\(Leader\)/ig, "")
-    .replace(/^\s*\d+\s+/, "") // remove leading numbers like "472 "
+    .replace(/^\s*\d+\s+/, "")
     .trim();
 }
 
@@ -29,34 +28,6 @@ function fixedCoinValue(nameNorm) {
   return null;
 }
 
-function normalizeLootItemName(raw) {
-  let s = String(raw).trim().toLowerCase();
-  s = s.replace(/^(a|an)\s+/, "");
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
-}
-
-function candidateNames(norm) {
-  const out = [norm];
-  if (norm.endsWith("coins")) out.push(norm.replace(/coins$/, "coin"));
-  if (norm.endsWith("ies")) out.push(norm.slice(0, -3) + "y");
-  if (norm.endsWith("es")) out.push(norm.slice(0, -2));
-  if (norm.endsWith("s")) out.push(norm.slice(0, -1));
-  if (norm === "gold coins") out.push("gold coin");
-  if (norm === "platinum coins") out.push("platinum coin");
-  if (norm === "crystal coins") out.push("crystal coin");
-  return [...new Set(out)].filter(Boolean);
-}
-
-async function resolveItemId(nameNorm) {
-  for (const cand of candidateNames(nameNorm)) {
-    const id = await getItemIdByName(cand);
-    if (typeof id === "number") return id;
-  }
-  return null;
-}
-
-// ---------- PARTY PARSER (strict: must find Supplies under the name) ----------
 export function parsePartyAnalyzerText(text) {
   const whole = String(text ?? "").replace(/\r\n/g, "\n");
   const lines = whole.split("\n").map(l => l.replace(/\t/g, "    "));
@@ -68,38 +39,25 @@ export function parsePartyAnalyzerText(text) {
     const line = lines[i].trim();
     if (!line) continue;
 
-    // Skip known non-player headings
     if (/^Session data:/i.test(line)) continue;
     if (/^Session:/i.test(line)) continue;
     if (/^Loot Type:/i.test(line)) continue;
     if (/^Loot:/i.test(line)) continue;
     if (/^Supplies:/i.test(line)) continue;
     if (/^Balance:/i.test(line)) continue;
-    if (/^Damage:/i.test(line)) continue;
-    if (/^Healing:/i.test(line)) continue;
 
-    // A player header in party analyzer is a line with no ":" and followed by indented stats including Supplies:
     if (line.includes(":")) continue;
 
     const name = cleanPlayerHeader(line);
     if (!name) continue;
     if (/^(Market|NPC|Custom)$/i.test(name)) continue;
 
-    // Look ahead for "Supplies:" in the next few lines.
     let supplies = null;
     for (let j = i + 1; j < Math.min(i + 25, lines.length); j++) {
       const t = lines[j].trim();
       const mSup = t.match(/^Supplies:\s*([-\d,]+)/i);
-      if (mSup) {
-        supplies = parseIntComma(mSup[1]);
-        break;
-      }
-      // stop scanning if we hit another player header candidate (non-empty, no colon)
-      if (t && !t.includes(":") && !/^Killed Monsters/i.test(t) && !/^Looted Items/i.test(t) && j > i + 1) {
-        // could be another player header
-        // but we only break if it looks like a name line (not a random word)
-        if (/^[A-Za-z0-9].*/.test(t)) break;
-      }
+      if (mSup) { supplies = parseIntComma(mSup[1]); break; }
+      if (t && !t.includes(":") && j > i + 1) break;
     }
 
     if (Number.isFinite(supplies)) {
@@ -114,7 +72,6 @@ export function parsePartyAnalyzerText(text) {
   return { players };
 }
 
-// ---------- LOOTER PARSER ----------
 export function parseLooterAnalyzerText(text) {
   const whole = String(text ?? "");
   const items = [];
@@ -133,26 +90,41 @@ export function parseLooterAnalyzerText(text) {
       const qty = Number(m[1]);
       if (!Number.isFinite(qty) || qty <= 0) continue;
 
-      items.push({ name: normalizeLootItemName(m[2]), qty });
+      let name = String(m[2]).trim().toLowerCase();
+      name = name.replace(/^(a|an)\s+/, "").replace(/\s+/g, " ").trim();
+
+      items.push({ name, qty });
     }
   }
 
   return { items };
 }
 
-// ---------- SETTLEMENT ----------
+function candidateNames(norm) {
+  const out = [norm];
+  if (norm.endsWith("coins")) out.push(norm.replace(/coins$/, "coin"));
+  if (norm.endsWith("ies")) out.push(norm.slice(0, -3) + "y");
+  if (norm.endsWith("es")) out.push(norm.slice(0, -2));
+  if (norm.endsWith("s")) out.push(norm.slice(0, -1));
+  return [...new Set(out)].filter(Boolean);
+}
+
+async function resolveItemId(nameNorm) {
+  for (const cand of candidateNames(nameNorm)) {
+    const id = await getItemIdByName(cand);
+    if (typeof id === "number") return id;
+  }
+  return null;
+}
+
 export async function computeCorrectedSettlementSecura({ party, lootersByName }) {
   if (!party?.players?.length) throw new Error("Party analyzer missing or no players parsed.");
 
-  const roster = party.players.map(p => ({
-    name: p.name,
-    supplies: p.supplies ?? 0
-  }));
-
+  const roster = party.players.map(p => ({ name: p.name, supplies: p.supplies ?? 0 }));
   const missing = roster.filter(p => !lootersByName.has(p.name)).map(p => p.name);
   if (missing.length) throw new Error(`Missing looter paste for: ${missing.join(", ")}`);
 
-  // Resolve items
+  // resolve all unique items once
   const uniqueNames = new Set();
   for (const p of roster) {
     const items = lootersByName.get(p.name) ?? [];
@@ -161,18 +133,13 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
   const nameToId = new Map();
   const unmatchedItemNames = [];
-
   for (const nm of uniqueNames) {
     const coin = fixedCoinValue(nm);
     if (coin != null) continue;
-
     const id = await resolveItemId(nm);
     if (id == null) unmatchedItemNames.push(nm);
     else nameToId.set(nm, id);
   }
-
-  const allIds = [...new Set([...nameToId.values()])];
-  const boards = await fetchMarketBoards("Secura", allIds);
 
   const perPlayer = [];
   const sellInstructionsByPlayer = new Map();
@@ -195,23 +162,19 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
     for (const [nameNorm, qty] of qtyByName.entries()) {
       const coinV = fixedCoinValue(nameNorm);
-      if (coinV != null) {
-        heldLootValue += qty * coinV;
-        continue;
-      }
+      if (coinV != null) { heldLootValue += qty * coinV; continue; }
 
       const id = nameToId.get(nameNorm);
-      if (!id) {
-        unmatched.push({ name: nameNorm, qty });
-        continue;
-      }
+      if (!id) { unmatched.push({ name: nameNorm, qty }); continue; }
 
-      const board = boards.get(id);
-      const depth = board ? computeInstantSellValueFromBoard(board, qty) : { value: 0, usedLevels: [] };
+      // market depth for THIS item
+      const board = await fetchMarketBoard("Secura", id);
+      const depth = computeInstantSellValueFromBoard(board, qty);
       const marketInstantTotal = depth.value;
 
       const npcBuy = await getBestNpcBuyPrice(id);
       const npcTotal = npcBuy * qty;
+
       const npcBuyers = await getNpcBuyersById(id);
       const bestNpc = npcBuyers?.[0]?.name ? `${npcBuyers[0].name} (${npcBuyers[0].price})` : "";
 
@@ -220,20 +183,13 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
       heldLootValue += chosenTotal;
 
       const topBuy = depth.usedLevels?.[0]?.price ?? 0;
-      const listSuggest = topBuy > 0 ? (topBuy + 1) : 0;
 
       const row = {
-        name: nameNorm,
-        qty,
-        itemId: id,
-        chosenTotal,
-        marketInstantTotal,
-        npcTotal,
-        npcBuy,
-        bestNpc,
+        name: nameNorm, qty, itemId: id,
+        chosenTotal, marketInstantTotal, npcTotal,
+        npcBuy, bestNpc,
         usedLevels: depth.usedLevels ?? [],
-        topBuy,
-        listSuggest
+        topBuy
       };
 
       if (chooseMarket) sellMarket.push(row);
@@ -247,7 +203,6 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
     totalHeldLoot += heldLootValue;
     totalSupplies += p.supplies;
-
     perPlayer.push({ name: p.name, supplies: p.supplies, heldLootValue });
   }
 
@@ -256,7 +211,6 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
 
   const payers = [];
   const receivers = [];
-
   for (const p of perPlayer) {
     p.fairPayout = p.supplies + share;
     p.delta = p.heldLootValue - p.fairPayout;
@@ -267,12 +221,10 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
   const transfers = [];
   let i = 0, j = 0;
   while (i < payers.length && j < receivers.length) {
-    const pay = payers[i];
-    const rec = receivers[j];
+    const pay = payers[i], rec = receivers[j];
     const x = Math.min(pay.amt, rec.amt);
     transfers.push({ from: pay.name, to: rec.name, amount: x });
-    pay.amt -= x;
-    rec.amt -= x;
+    pay.amt -= x; rec.amt -= x;
     if (pay.amt === 0) i++;
     if (rec.amt === 0) j++;
   }
