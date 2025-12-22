@@ -101,7 +101,10 @@ client.on("interactionCreate", async interaction => {
 
         sess.party = party;
 
-        const names = party.players.map(p => `${p.name} (supplies ${fmtInt(p.supplies)})`).join("\n");
+        const names = party.players
+          .map(p => `${p.name} (supplies ${fmtInt(p.supplies)})`)
+          .join("\n");
+
         return interaction.reply({
           ephemeral: false,
           content:
@@ -115,7 +118,9 @@ client.on("interactionCreate", async interaction => {
 
     if (sub === "looter") {
       const sess = sessions.get(interaction.channelId);
-      if (!sess?.party) return interaction.reply({ content: "Paste party first using **/settle party**.", ephemeral: true });
+      if (!sess?.party) {
+        return interaction.reply({ content: "Paste party first using **/settle party**.", ephemeral: true });
+      }
 
       const nameInput = interaction.options.getString("name", true);
       const rosterName = findRosterName(sess.party, nameInput);
@@ -142,33 +147,42 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (sub === "done") {
-      // MUST defer, settlement can take > 3s due to API throttling
+      // MUST defer, settlement can take time due to API limits
       await interaction.deferReply({ ephemeral: false });
 
       const sess = sessions.get(interaction.channelId);
       if (!sess?.party) return interaction.editReply("Paste party first using **/settle party**.");
 
-      const missing = sess.party.players.filter(p => !sess.lootersByName.has(p.name)).map(p => p.name);
+      const missing = sess.party.players
+        .filter(p => !sess.lootersByName.has(p.name))
+        .map(p => p.name);
+
       if (missing.length) return interaction.editReply(`Missing looter paste for: ${missing.join(", ")}`);
 
       try {
+        // FAST-mode settlement: NPC baseline + limited market checks
         const result = await computeCorrectedSettlementSecura({
           party: sess.party,
-          lootersByName: sess.lootersByName
+          lootersByName: sess.lootersByName,
+          topKMarketChecks: 5
         });
 
         const n = result.perPlayer.length;
         const remainder = result.correctedNet - (result.share * n);
 
+        const marketCompleted = result.marketCheck?.completed ?? 0;
+        const marketAttempted = result.marketCheck?.attempted ?? 0;
+
         const summary =
-          `Hunt Settlement — Corrected Loot (Market depth BUY vs NPC BUY) + Equal Split\n` +
+          `Hunt Settlement — Corrected Loot (NPC baseline + Market depth for top items) + Equal Split\n` +
           `World: Secura | Updated: ${result.updatedAt.toISOString()}\n\n` +
           `Totals\n` +
           `Corrected total loot: ${fmtInt(result.totalHeldLoot)} gp\n` +
           `Total supplies: ${fmtInt(result.totalSupplies)} gp\n` +
           `Corrected net: ${fmtInt(result.correctedNet)} gp\n` +
           `Profit per player: ${fmtInt(result.share)} gp\n` +
-          `Remainder: ${fmtInt(remainder)} gp\n\n` +
+          `Remainder: ${fmtInt(remainder)} gp\n` +
+          `Market checks used: ${marketCompleted}/${marketAttempted} (API limit: 5/min)\n\n` +
           `Per-player accounting\n` +
           result.perPlayer.map(p =>
             `• ${p.name} held ${fmtInt(p.heldLootValue)} | supplies ${fmtInt(p.supplies)} | payout ${fmtInt(p.fairPayout)} | delta ${fmtInt(p.delta)}`
@@ -183,6 +197,15 @@ client.on("interactionCreate", async interaction => {
             .map(x => `• ${x.from} → ${x.to}: ${fmtInt(x.amount)} gp`)
             .join("\n");
           await interaction.followUp("```text\nTransfers (who sends who)\n" + t + "\n```");
+        }
+
+        // Optional: show if market checks were blocked
+        const errs = result.marketCheck?.errors ?? [];
+        if (errs.length) {
+          await interaction.followUp({
+            ephemeral: true,
+            content: `Market check warnings:\n\`\`\`\n${errs.slice(0, 3).join("\n")}\n\`\`\``
+          });
         }
 
         sessions.delete(interaction.channelId);
