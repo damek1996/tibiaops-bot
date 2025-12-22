@@ -1,92 +1,82 @@
 ﻿import "dotenv/config";
 import { REST, Routes } from "discord.js";
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-const GUILD_ID = process.env.DISCORD_GUILD_ID;
+const token = process.env.DISCORD_TOKEN;
+const clientId = process.env.DISCORD_CLIENT_ID;
 
-if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error("Missing env: DISCORD_TOKEN / DISCORD_CLIENT_ID / DISCORD_GUILD_ID");
-  process.exit(1);
-}
+if (!token) throw new Error("Missing DISCORD_TOKEN in .env");
+if (!clientId) throw new Error("Missing DISCORD_CLIENT_ID in .env");
 
 const commands = [
   {
     name: "price",
-    description: "Check Secura market price (BUY/SELL) for an item",
+    description: "Check Secura market BUY offer vs NPC buy for an item",
     options: [
-      { type: 3, name: "item", description: "Item name", required: true, max_length: 100 }
+      {
+        type: 3,
+        name: "item",
+        description: "Item name (e.g. soulbleeder, gold coin)",
+        required: true
+      }
     ]
   },
   {
     name: "settle",
-    description: "Corrected loot + equal split + transfers + sell browser",
+    description: "Hunt settlement tools",
     options: [
       {
         type: 1,
         name: "start",
         description: "Start a settlement session",
         options: [
-          { type: 3, name: "world", description: "World (default Secura)", required: false, max_length: 50 }
+          {
+            type: 3,
+            name: "world",
+            description: "Tibia world (default: Secura)",
+            required: false
+          }
         ]
       },
       {
         type: 1,
         name: "party",
-        description: "Provide Party Hunt Analyzer (text OR attachment .txt)",
+        description: "Paste Party Hunt Analyzer",
         options: [
-          {
-            type: 3,
-            name: "text",
-            description: "Paste Party Hunt Analyzer OR leave empty and attach a .txt",
-            required: false,
-            max_length: 6000
-          },
-          {
-            type: 11,
-            name: "file",
-            description: "Attach a .txt file with Party Hunt Analyzer (recommended)",
-            required: false
-          }
+          { type: 3, name: "text", description: "Paste analyzer text", required: false },
+          { type: 11, name: "file", description: "Attach .txt with analyzer", required: false }
         ]
       },
       {
         type: 1,
         name: "looter",
-        description: "Provide player's analyzer with Looted Items (pick name from autocomplete)",
+        description: "Submit a player's looted items analyzer (use dropdown if no name)",
         options: [
           {
             type: 3,
             name: "name",
-            description: "Pick player name from suggestions",
-            required: true,
-            autocomplete: true
-          },
-          {
-            type: 3,
-            name: "text",
-            description: "Paste player analyzer OR leave empty and attach a .txt",
-            required: false,
-            max_length: 6000
-          },
-          {
-            type: 11,
-            name: "file",
-            description: "Attach a .txt file with player analyzer (recommended)",
+            description: "Optional exact party name (recommended: leave empty and use dropdown)",
             required: false
-          }
+          },
+          { type: 3, name: "text", description: "Paste analyzer text", required: false },
+          { type: 11, name: "file", description: "Attach .txt with analyzer", required: false }
         ]
       },
       {
         type: 1,
         name: "done",
-        description: "Compute corrected loot, transfers, and create sell browser"
+        description: "Compute equal split + transfers + sell instructions"
       }
     ]
   }
 ];
 
-const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
-console.log("Registering slash commands...");
-await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-console.log("Done.");
+const rest = new REST({ version: "10" }).setToken(token);
+
+try {
+  console.log("Registering slash commands...");
+  await rest.put(Routes.applicationCommands(clientId), { body: commands });
+  console.log("Slash commands registered successfully.");
+} catch (err) {
+  console.error(err);
+  process.exit(1);
+}
