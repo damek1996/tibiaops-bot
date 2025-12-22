@@ -7,7 +7,7 @@
   computeInstantSellValueFromBoard
 } from "./provider.mjs";
 
-// ---- parsing helpers ----
+// ---------- helpers ----------
 function parseIntComma(s) {
   if (s == null) return null;
   const cleaned = String(s).replace(/,/g, "").trim();
@@ -15,33 +15,11 @@ function parseIntComma(s) {
   return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
-function stripLeadingJunkName(name) {
-  return String(name ?? "")
-    .replace(/^\s*\d+\s+/, "")
+function cleanPlayerHeader(line) {
+  return String(line ?? "")
     .replace(/\(Leader\)/ig, "")
+    .replace(/^\s*\d+\s+/, "") // remove leading numbers like "472 "
     .trim();
-}
-
-function isNonPlayerHeading(t) {
-  const s = t.trim();
-  if (!s) return true;
-  if (s.includes(":")) return true;
-  if (/^Session data/i.test(s)) return true;
-  if (/^Session:/i.test(s)) return true;
-  if (/^Loot Type/i.test(s)) return true;
-  if (/^Looted Items/i.test(s)) return true;
-  if (/^Killed Monsters/i.test(s)) return true;
-  if (/^Damage/i.test(s)) return true;
-  if (/^Healing/i.test(s)) return true;
-  if (/^(Market|NPC|Custom)$/i.test(s)) return true;
-  return false;
-}
-
-export function normalizeLootItemName(raw) {
-  let s = String(raw).trim().toLowerCase();
-  s = s.replace(/^(a|an)\s+/, "");
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
 }
 
 function fixedCoinValue(nameNorm) {
@@ -49,6 +27,13 @@ function fixedCoinValue(nameNorm) {
   if (nameNorm === "platinum coin" || nameNorm === "platinum coins") return 100;
   if (nameNorm === "crystal coin" || nameNorm === "crystal coins") return 10000;
   return null;
+}
+
+function normalizeLootItemName(raw) {
+  let s = String(raw).trim().toLowerCase();
+  s = s.replace(/^(a|an)\s+/, "");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
 }
 
 function candidateNames(norm) {
@@ -71,36 +56,65 @@ async function resolveItemId(nameNorm) {
   return null;
 }
 
-// ---- Party analyzer parser ----
+// ---------- PARTY PARSER (strict: must find Supplies under the name) ----------
 export function parsePartyAnalyzerText(text) {
   const whole = String(text ?? "").replace(/\r\n/g, "\n");
-  const lines = whole.split("\n").map(l => l.replace(/\t/g, "    ").trimEnd());
+  const lines = whole.split("\n").map(l => l.replace(/\t/g, "    "));
 
   const players = [];
+  const seen = new Set();
 
   for (let i = 0; i < lines.length; i++) {
-    const headerRaw = lines[i].trim();
-    if (isNonPlayerHeading(headerRaw)) continue;
+    const line = lines[i].trim();
+    if (!line) continue;
 
-    const nameClean = stripLeadingJunkName(headerRaw);
-    if (!nameClean) continue;
+    // Skip known non-player headings
+    if (/^Session data:/i.test(line)) continue;
+    if (/^Session:/i.test(line)) continue;
+    if (/^Loot Type:/i.test(line)) continue;
+    if (/^Loot:/i.test(line)) continue;
+    if (/^Supplies:/i.test(line)) continue;
+    if (/^Balance:/i.test(line)) continue;
+    if (/^Damage:/i.test(line)) continue;
+    if (/^Healing:/i.test(line)) continue;
 
+    // A player header in party analyzer is a line with no ":" and followed by indented stats including Supplies:
+    if (line.includes(":")) continue;
+
+    const name = cleanPlayerHeader(line);
+    if (!name) continue;
+    if (/^(Market|NPC|Custom)$/i.test(name)) continue;
+
+    // Look ahead for "Supplies:" in the next few lines.
     let supplies = null;
-
-    for (let j = i + 1; j < Math.min(i + 12, lines.length); j++) {
+    for (let j = i + 1; j < Math.min(i + 25, lines.length); j++) {
       const t = lines[j].trim();
       const mSup = t.match(/^Supplies:\s*([-\d,]+)/i);
-      if (mSup) supplies = parseIntComma(mSup[1]);
-      if (j > i + 1 && !t.includes(":") && !isNonPlayerHeading(t)) break;
+      if (mSup) {
+        supplies = parseIntComma(mSup[1]);
+        break;
+      }
+      // stop scanning if we hit another player header candidate (non-empty, no colon)
+      if (t && !t.includes(":") && !/^Killed Monsters/i.test(t) && !/^Looted Items/i.test(t) && j > i + 1) {
+        // could be another player header
+        // but we only break if it looks like a name line (not a random word)
+        if (/^[A-Za-z0-9].*/.test(t)) break;
+      }
     }
 
-    if (Number.isFinite(supplies)) players.push({ name: nameClean, supplies });
+    if (Number.isFinite(supplies)) {
+      const key = name.toLowerCase();
+      if (!seen.has(key)) {
+        players.push({ name, supplies });
+        seen.add(key);
+      }
+    }
   }
 
   return { players };
 }
 
-// ---- Looter analyzer parser ----
+// ---------- LOOTER PARSER ----------
 export function parseLooterAnalyzerText(text) {
   const whole = String(text ?? "");
   const items = [];
@@ -126,7 +140,7 @@ export function parseLooterAnalyzerText(text) {
   return { items };
 }
 
-// ---- Settlement with depth liquidation ----
+// ---------- SETTLEMENT ----------
 export async function computeCorrectedSettlementSecura({ party, lootersByName }) {
   if (!party?.players?.length) throw new Error("Party analyzer missing or no players parsed.");
 
@@ -135,14 +149,10 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
     supplies: p.supplies ?? 0
   }));
 
-  const n = roster.length;
-  if (n <= 0) throw new Error("No players in party.");
-
-  // ensure each player pasted looter
   const missing = roster.filter(p => !lootersByName.has(p.name)).map(p => p.name);
   if (missing.length) throw new Error(`Missing looter paste for: ${missing.join(", ")}`);
 
-  // Resolve all unique items -> IDs
+  // Resolve items
   const uniqueNames = new Set();
   for (const p of roster) {
     const items = lootersByName.get(p.name) ?? [];
@@ -161,11 +171,9 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
     else nameToId.set(nm, id);
   }
 
-  // Fetch depth boards in batches (only looted item ids)
   const allIds = [...new Set([...nameToId.values()])];
   const boards = await fetchMarketBoards("Secura", allIds);
 
-  // Compute per-player
   const perPlayer = [];
   const sellInstructionsByPlayer = new Map();
 
@@ -186,7 +194,6 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
     const unmatched = [];
 
     for (const [nameNorm, qty] of qtyByName.entries()) {
-      // coin handling
       const coinV = fixedCoinValue(nameNorm);
       if (coinV != null) {
         heldLootValue += qty * coinV;
@@ -208,17 +215,11 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
       const npcBuyers = await getNpcBuyersById(id);
       const bestNpc = npcBuyers?.[0]?.name ? `${npcBuyers[0].name} (${npcBuyers[0].price})` : "";
 
-      // choose best liquidation
       const chooseMarket = marketInstantTotal > npcTotal;
       const chosenTotal = Math.max(marketInstantTotal, npcTotal);
       heldLootValue += chosenTotal;
 
-      // derive “suggested offer” prices from depth
-      // if you want “instant”: use top buy level price (first level)
       const topBuy = depth.usedLevels?.[0]?.price ?? 0;
-
-      // “list” suggestion: slightly above top buy if spread exists — but without sellOffer endpoint
-      // we can at least suggest: list at topBuy + 1 (or +small) for stackables
       const listSuggest = topBuy > 0 ? (topBuy + 1) : 0;
 
       const row = {
@@ -251,9 +252,8 @@ export async function computeCorrectedSettlementSecura({ party, lootersByName })
   }
 
   const correctedNet = totalHeldLoot - totalSupplies;
-  const share = Math.floor(correctedNet / n);
+  const share = Math.floor(correctedNet / roster.length);
 
-  // fair payout = supplies + share
   const payers = [];
   const receivers = [];
 

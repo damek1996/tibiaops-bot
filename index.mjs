@@ -244,21 +244,58 @@ client.on("interactionCreate", async interaction => {
     }
   }
 
-  if (sub === "done") {
-await interaction.deferReply({ ephemeral: false });
-    const sess = sessions.get(interaction.channelId);
-    if (!sess?.party) return interaction.reply({ content: "Paste party first using `/settle party`.", ephemeral: true });
+if (sub === "done") {
+  // IMPORTANT: avoid "Unknown interaction" by deferring immediately
+  await interaction.deferReply({ ephemeral: false });
 
-    const missing = sess.party.players.filter(p => !sess.lootersByName.has(p.name)).map(p => p.name);
-    if (missing.length) {
-      return interaction.reply({ content: `Missing looter analyzer for: ${missing.join(", ")}`, ephemeral: true });
+  try {
+    const sess = sessions.get(interaction.channelId);
+    if (!sess?.party) {
+      return interaction.editReply("Paste party first using `/settle party`.");
     }
 
-    try {
-      const result = await computeCorrectedSettlementSecura({
-        party: sess.party,
-        lootersByName: sess.lootersByName
-      });
+    const missing = sess.party.players
+      .filter(p => !sess.lootersByName.has(p.name))
+      .map(p => p.name);
+
+    if (missing.length) {
+      return interaction.editReply(`Missing looter analyzer for: ${missing.join(", ")}`);
+    }
+
+    const result = await computeCorrectedSettlementSecura({
+      party: sess.party,
+      lootersByName: sess.lootersByName
+    });
+
+    // Build a short, visible summary so people know it worked
+    const nPlayers = result.perPlayer.length;
+    const remainder = result.correctedNet - (result.share * nPlayers);
+
+    const lines = [];
+    lines.push(`Players: ${nPlayers}`);
+    lines.push(`Corrected loot: ${fmtInt(result.totalHeldLoot)} gp`);
+    lines.push(`Supplies: ${fmtInt(result.totalSupplies)} gp`);
+    lines.push(`Net profit: ${fmtInt(result.correctedNet)} gp`);
+    lines.push(`Profit per player: ${fmtInt(result.share)} gp`);
+    lines.push(`Remainder: ${fmtInt(remainder)} gp`);
+
+    await interaction.editReply("```text\n" + lines.join("\n") + "\n```");
+
+    // Transfers message
+    if (!result.transfers.length) {
+      await interaction.followUp("```text\nNo transfers needed.\n```");
+    } else {
+      const tlines = result.transfers.map(t => `${t.from} -> ${t.to}: ${fmtInt(t.amount)} gp`);
+      await interaction.followUp("```text\n" + tlines.join("\n") + "\n```");
+    }
+
+    sessions.delete(interaction.channelId);
+  } catch (e) {
+    // Always show errors publicly since this channel is shared workflow
+    await interaction.editReply(`Settlement failed: ${e.message}`);
+  }
+}
+
 
       const nPlayers = result.perPlayer.length;
       const remainder = result.correctedNet - (result.share * nPlayers);
