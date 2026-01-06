@@ -13,38 +13,49 @@ import {
   computeCorrectedSettlementSecura
 } from "./settle.mjs";
 
+/* =======================
+   CLIENT
+======================= */
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-// channelId -> settlement session state during collection
+/* =======================
+   STATE
+======================= */
+
+// channelId → active settlement session
 const sessions = new Map();
 
-// channelId -> { createdAtMs, players: string[], sellInstructionsByPlayer: Map(name -> instr) }
+// channelId → instruction board
 const instructionBoards = new Map();
 const INSTRUCTION_TTL_MS = 30 * 60 * 1000;
 
+/* =======================
+   HELPERS
+======================= */
+
 function fmtInt(n) {
-  return new Intl.NumberFormat("en-US").format(Math.trunc(n));
+  return Math.trunc(n).toString();
 }
 
 async function readInputText(interaction) {
   const text = interaction.options.getString("text", false);
   const file = interaction.options.getAttachment("file", false);
 
-  if (text && text.trim().length) return text;
+  if (text && text.trim()) return text;
 
   if (file?.url) {
     const res = await fetch(file.url);
-    if (!res.ok) throw new Error(`Failed to download attachment (${res.status})`);
+    if (!res.ok) throw new Error("Failed to download attachment");
     return await res.text();
   }
 
-  throw new Error("Provide either text OR attach a .txt file.");
+  throw new Error("Provide text or attach a .txt file.");
 }
 
-function rosterNamesRemaining(sess) {
-  if (!sess?.party?.players?.length) return [];
+function rosterRemaining(sess) {
   const submitted = new Set([...sess.lootersByName.keys()].map(x => x.toLowerCase()));
   return sess.party.players
     .map(p => p.name)
@@ -52,327 +63,287 @@ function rosterNamesRemaining(sess) {
 }
 
 function buildLooterSelect(sess) {
-  const remaining = rosterNamesRemaining(sess);
-  const options = remaining.slice(0, 25).map(n => ({ label: n, value: n }));
+  const names = rosterRemaining(sess);
+
+  const options = names.slice(0, 25).map(n => ({
+    label: n,
+    value: n
+  }));
+
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId("settle_looter_select")
-      .setPlaceholder(remaining.length ? "Select your character…" : "All looters already submitted")
+      .setPlaceholder("Select your character…")
       .setMinValues(1)
       .setMaxValues(1)
-      .addOptions(options.length ? options : [{ label: "No names available", value: "__none__", default: true }])
+      .addOptions(options.length ? options : [{
+        label: "All looters submitted",
+        value: "__none__",
+        default: true
+      }])
       .setDisabled(!options.length)
   );
 }
 
-function purgeOldBoards() {
-  const now = Date.now();
-  for (const [channelId, b] of instructionBoards.entries()) {
-    if (!b?.createdAtMs || (now - b.createdAtMs) > INSTRUCTION_TTL_MS) instructionBoards.delete(channelId);
-  }
-}
-
-function buildInstructionSelect(channelId, players, selected = null) {
-  const options = players.slice(0, 25).map(name => ({
-    label: name,
-    value: `${channelId}::${name}`,
-    default: selected === name
-  }));
-
+function buildInstructionSelect(channelId, players, selected) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId("settle_instructions_select")
       .setPlaceholder("Pick a player to view sell instructions…")
       .setMinValues(1)
       .setMaxValues(1)
-      .addOptions(options)
+      .addOptions(
+        players.map(p => ({
+          label: p,
+          value: `${channelId}::${p}`,
+          default: p === selected
+        }))
+      )
   );
 }
 
-function renderInstructions(playerName, instr) {
+function renderInstructions(player, instr) {
   const lines = [];
-  lines.push(`Sell Instructions — ${playerName}`);
+  lines.push(`Sell Instructions — ${player}`);
   lines.push("");
 
   lines.push("SELL ON MARKET (highest BUY offer):");
-  if (!instr.sellMarket?.length) lines.push("• none");
-  else {
-    for (const r of instr.sellMarket.slice(0, 35)) {
-      lines.push(`• ${r.qty}x ${r.name} | BUY ${fmtInt(r.buyOffer)} ea | total ${fmtInt(r.marketTotal)} gp`);
-    }
-    if (instr.sellMarket.length > 35) lines.push(`…and ${instr.sellMarket.length - 35} more`);
+  if (!instr.sellMarket.length) lines.push("• none");
+  for (const r of instr.sellMarket) {
+    lines.push(`• ${r.qty}x ${r.name} @ ${fmtInt(r.buyOffer)} = ${fmtInt(r.marketTotal)} gp`);
   }
 
   lines.push("");
-  lines.push("SELL TO NPC (best buyer):");
-  if (!instr.sellNpc?.length) lines.push("• none");
-  else {
-    for (const r of instr.sellNpc.slice(0, 35)) {
-      const npcInfo = r.bestNpc ? ` | NPC ${r.bestNpc}` : "";
-      lines.push(`• ${r.qty}x ${r.name} | NPC ${fmtInt(r.npcBuy)} ea | total ${fmtInt(r.npcTotal)} gp${npcInfo}`);
-    }
-    if (instr.sellNpc.length > 35) lines.push(`…and ${instr.sellNpc.length - 35} more`);
+  lines.push("SELL TO NPC:");
+  if (!instr.sellNpc.length) lines.push("• none");
+  for (const r of instr.sellNpc) {
+    lines.push(`• ${r.qty}x ${r.name} @ ${fmtInt(r.npcBuy)} = ${fmtInt(r.npcTotal)} gp`);
   }
 
-  if (instr.unmatched?.length) {
+  if (instr.unmatched.length) {
     lines.push("");
-    lines.push("UNMATCHED (not priced):");
-    for (const u of instr.unmatched.slice(0, 25)) lines.push(`• ${u.qty}x ${u.name}`);
-    if (instr.unmatched.length > 25) lines.push(`…and ${instr.unmatched.length - 25} more`);
+    lines.push("UNMATCHED:");
+    for (const r of instr.unmatched) {
+      lines.push(`• ${r.qty}x ${r.name}`);
+    }
   }
 
-  // keep under 1900 chars
-  let out = lines.join("\n");
-  if (out.length > 1800) out = out.slice(0, 1800) + "\n…(truncated)";
-  return "```text\n" + out + "\n```";
+  return "```text\n" + lines.join("\n") + "\n```";
 }
+
+/* =======================
+   INTERACTIONS
+======================= */
 
 client.on("interactionCreate", async interaction => {
   try {
-    purgeOldBoards();
 
-    // Instructions dropdown handler
-    if (interaction.isStringSelectMenu() && interaction.customId === "settle_instructions_select") {
-      const pick = interaction.values?.[0] ?? "";
-      const [channelId, playerName] = pick.split("::");
-      if (!channelId || !playerName) {
-        return interaction.reply({ ephemeral: true, content: "Invalid selection." });
-      }
+    /* ===== instruction dropdown ===== */
+    if (interaction.isStringSelectMenu() &&
+        interaction.customId === "settle_instructions_select") {
 
+      const [channelId, name] = interaction.values[0].split("::");
       const board = instructionBoards.get(channelId);
+
       if (!board) {
-        return interaction.reply({ ephemeral: true, content: "Instruction board expired. Run /settle done again." });
+        return interaction.reply({ ephemeral: true, content: "Instruction board expired." });
       }
 
-      const instr = board.sellInstructionsByPlayer.get(playerName);
+      const instr = board.sellInstructionsByPlayer.get(name);
       if (!instr) {
-        return interaction.reply({ ephemeral: true, content: `No instruction data for ${playerName}.` });
+        return interaction.reply({ ephemeral: true, content: "No data for player." });
       }
 
-      const content = renderInstructions(playerName, instr);
-      const row = buildInstructionSelect(channelId, board.players, playerName);
-
-      // Edit the same message (clean UX)
-      return interaction.update({ content, components: [row] });
+      return interaction.update({
+        content: renderInstructions(name, instr),
+        components: [buildInstructionSelect(channelId, board.players, name)]
+      });
     }
 
-    // Looter dropdown handler
-    if (interaction.isStringSelectMenu() && interaction.customId === "settle_looter_select") {
+    /* ===== looter dropdown ===== */
+    if (interaction.isStringSelectMenu() &&
+        interaction.customId === "settle_looter_select") {
+
       const sess = sessions.get(interaction.channelId);
-      if (!sess?.party) {
-        return interaction.reply({ ephemeral: true, content: "No active settlement here. Run /settle start." });
+      if (!sess) {
+        return interaction.reply({ ephemeral: true, content: "No active settlement." });
       }
 
-      const chosen = interaction.values?.[0];
-      if (!chosen || chosen === "__none__") {
-        return interaction.reply({ ephemeral: true, content: "No character selected." });
-      }
+      const name = interaction.values[0];
+      if (name === "__none__") return;
 
-      sess.pendingLooterSelection ??= new Map();
-      sess.pendingLooterSelection.set(interaction.user.id, chosen);
+      sess.pendingLooterByUser.set(interaction.user.id, name);
 
       return interaction.reply({
         ephemeral: true,
-        content: `Selected **${chosen}**. Now run **/settle looter** and paste your analyzer text (no need to type name).`
+        content: `Selected **${name}**. Now run /settle looter and paste analyzer.`
       });
     }
 
     if (!interaction.isChatInputCommand()) return;
 
-    // /price
+    /* ===== /price ===== */
     if (interaction.commandName === "price") {
       const item = interaction.options.getString("item", true);
-      try {
-        const p = await getPriceSecuraByName(item);
-        if (!p.found) {
-          return interaction.reply({ content: `No data for **${item}** (${p.reason}).`, ephemeral: true });
-        }
-        return interaction.reply({
-          ephemeral: true,
-          content:
-            `**${item}** (Secura)\n` +
-            `Snapshot: ${p.updatedAt.toISOString()}\n` +
-            `Market BUY offer: **${formatGold(p.buy)} gp**\n` +
-            `NPC buy (best): **${formatGold(p.npc)} gp**`
-        });
-      } catch (e) {
-        return interaction.reply({ content: `Price failed: ${e.message}`, ephemeral: true });
+      const p = await getPriceSecuraByName(item);
+
+      if (!p.found) {
+        return interaction.reply({ ephemeral: true, content: "Item not found." });
       }
+
+      return interaction.reply({
+        ephemeral: true,
+        content:
+          `**${item}** (Secura)\n` +
+          `Market BUY: ${formatGold(p.buy)} gp\n` +
+          `NPC BUY: ${formatGold(p.npc)} gp`
+      });
     }
 
     if (interaction.commandName !== "settle") return;
     const sub = interaction.options.getSubcommand();
 
+    /* ===== start ===== */
     if (sub === "start") {
-      const world = interaction.options.getString("world") ?? "Secura";
       sessions.set(interaction.channelId, {
-        world,
         party: null,
         lootersByName: new Map(),
-        pendingLooterSelection: new Map()
+        pendingLooterByUser: new Map()
       });
 
-      return interaction.reply({
-        ephemeral: false,
-        content:
-          `Settlement started for **${world}**.\n` +
-          `1) Paste Party Hunt Analyzer with **/settle party**\n` +
-          `2) Players submit looter logs using **/settle looter** (dropdown)\n` +
-          `3) Run **/settle done**`
-      });
+      return interaction.reply(
+        "Settlement started.\n" +
+        "1) /settle party\n" +
+        "2) /settle looter\n" +
+        "3) /settle done"
+      );
     }
 
+    /* ===== party ===== */
     if (sub === "party") {
       const sess = sessions.get(interaction.channelId);
-      if (!sess) return interaction.reply({ content: "Run **/settle start** first.", ephemeral: true });
+      if (!sess) return interaction.reply({ ephemeral: true, content: "Run /settle start first." });
 
-      try {
-        const partyText = await readInputText(interaction);
-        const party = parsePartyAnalyzerText(partyText);
+      const text = await readInputText(interaction);
+      const party = parsePartyAnalyzerText(text);
 
-        if (!party.players.length) {
-          return interaction.reply({
-            ephemeral: true,
-            content: "Could not parse players/supplies from Party Hunt Analyzer. Paste the full party block."
-          });
-        }
-
-        sess.party = party;
-        sess.lootersByName.clear();
-        sess.pendingLooterSelection.clear();
-
-        const names = party.players.map(p => `${p.name} (supplies ${fmtInt(p.supplies)})`).join("\n");
-        return interaction.reply({
-          ephemeral: false,
-          content: `Party loaded. Players: **${party.players.length}**\n` + "```text\n" + names + "\n```"
-        });
-      } catch (e) {
-        return interaction.reply({ content: `Party load failed: ${e.message}`, ephemeral: true });
+      if (!party.players.length) {
+        return interaction.reply({ ephemeral: true, content: "Could not parse party." });
       }
+
+      sess.party = party;
+      sess.lootersByName.clear();
+      sess.pendingLooterByUser.clear();
+
+      return interaction.reply(
+        "Party loaded:\n```text\n" +
+        party.players.map(p => `${p.name} | supplies ${fmtInt(p.supplies)}`).join("\n") +
+        "\n```"
+      );
     }
 
+    /* ===== looter ===== */
     if (sub === "looter") {
       const sess = sessions.get(interaction.channelId);
       if (!sess?.party) {
-        return interaction.reply({ content: "Paste party first using **/settle party**.", ephemeral: true });
+        return interaction.reply({ ephemeral: true, content: "Paste party first." });
       }
 
-      const typedName = interaction.options.getString("name", false);
-      let rosterName = null;
-
-      if (typedName && typedName.trim().length) {
-        const x = typedName.trim().toLowerCase();
-        rosterName = sess.party.players.find(p => p.name.toLowerCase() === x)?.name ?? null;
-        if (!rosterName) {
+      let name = interaction.options.getString("name", false);
+      if (!name) {
+        name = sess.pendingLooterByUser.get(interaction.user.id);
+        if (!name) {
           return interaction.reply({
             ephemeral: true,
-            content: `Name not in party roster: **${typedName}**. Use dropdown: run /settle looter without name.`
+            content: "Select your character:",
+            components: [buildLooterSelect(sess)]
           });
         }
-      } else {
-        rosterName = sess.pendingLooterSelection?.get(interaction.user.id) ?? null;
-        if (!rosterName) {
-          const row = buildLooterSelect(sess);
-          return interaction.reply({ ephemeral: true, content: "Pick your character:", components: [row] });
-        }
       }
 
-      const already = sess.lootersByName.has(rosterName);
+      const text = await readInputText(interaction);
+      const parsed = parseLooterAnalyzerText(text);
 
-      try {
-        const looterText = await readInputText(interaction);
-        const parsed = parseLooterAnalyzerText(looterText);
-        sess.lootersByName.set(rosterName, parsed.items ?? []);
-        sess.pendingLooterSelection?.delete(interaction.user.id);
+      sess.lootersByName.set(name, parsed.items ?? []);
+      sess.pendingLooterByUser.delete(interaction.user.id);
 
-        const remaining = rosterNamesRemaining(sess);
-
-        return interaction.reply({
-          ephemeral: false,
-          content:
-            `${already ? "Updated" : "Captured"} looter for **${rosterName}**. Items parsed: **${(parsed.items ?? []).length}**\n` +
-            `Remaining submissions: **${remaining.length}**` +
-            (remaining.length ? ` (${remaining.join(", ")})` : "")
-        });
-      } catch (e) {
-        return interaction.reply({ content: `Looter load failed: ${e.message}`, ephemeral: true });
-      }
+      return interaction.reply(`Captured looter for **${name}**.`);
     }
 
+    /* ===== done ===== */
     if (sub === "done") {
-      await interaction.deferReply({ ephemeral: false });
+      await interaction.deferReply();
 
       const sess = sessions.get(interaction.channelId);
-      if (!sess?.party) return interaction.editReply("Paste party first using **/settle party**.");
+      if (!sess?.party) return interaction.editReply("Missing party.");
 
-      const missing = sess.party.players.filter(p => !sess.lootersByName.has(p.name)).map(p => p.name);
-      if (missing.length) return interaction.editReply(`Missing looter paste for: ${missing.join(", ")}`);
+      const missing = sess.party.players
+        .map(p => p.name)
+        .filter(n => !sess.lootersByName.has(n));
 
-      try {
-        const result = await computeCorrectedSettlementSecura({
-          party: sess.party,
-          lootersByName: sess.lootersByName
-        });
+      if (missing.length) {
+        return interaction.editReply("Missing looters: " + missing.join(", "));
+      }
 
-        const n = result.perPlayer.length;
-        const remainder = result.correctedNet - (result.share * n);
+      const result = await computeCorrectedSettlementSecura(sess);
 
-        const summary =
-          `Hunt Settlement — Corrected Loot (Market BUY offer vs NPC buy) + Equal Split\n` +
-          `World: Secura | Updated: ${result.updatedAt.toISOString()}\n\n` +
-          `Totals\n` +
-          `Corrected total loot: ${fmtInt(result.totalHeldLoot)} gp\n` +
-          `Total supplies: ${fmtInt(result.totalSupplies)} gp\n` +
-          `Corrected net: ${fmtInt(result.correctedNet)} gp\n` +
-          `Profit per player: ${fmtInt(result.share)} gp\n` +
-          `Remainder: ${fmtInt(remainder)} gp\n\n` +
-          `Per-player accounting\n` +
-          result.perPlayer.map(p =>
-            `• ${p.name} held ${fmtInt(p.heldLootValue)} | supplies ${fmtInt(p.supplies)} | payout ${fmtInt(p.fairPayout)} | delta ${fmtInt(p.delta)}`
-          ).join("\n");
+      await interaction.editReply(
+        "```text\n" +
+        result.summaryText +
+        "\n```"
+      );
 
-        await interaction.editReply("```text\n" + summary + "\n```");
-
-        if (!result.transfers.length) {
-          await interaction.followUp("```text\nTransfers\nNo transfers needed.\n```");
-        } else {
-          const t = result.transfers.map(x => `• ${x.from} → ${x.to}: ${fmtInt(x.amount)} gp`).join("\n");
-          await interaction.followUp("```text\nTransfers (who sends who)\n" + t + "\n```");
+      // transfers (optimized)
+      if (result.transfers.length) {
+        const grouped = new Map();
+        for (const t of result.transfers) {
+          if (!grouped.has(t.from)) grouped.set(t.from, []);
+          grouped.get(t.from).push(t);
         }
 
-        // Save instruction board for dropdown rendering
-        const players = result.perPlayer.map(p => p.name);
-        instructionBoards.set(interaction.channelId, {
-          createdAtMs: Date.now(),
-          players,
-          sellInstructionsByPlayer: result.sellInstructionsByPlayer
-        });
+        const lines = [];
+        for (const [from, arr] of grouped.entries()) {
+          lines.push(`${from}:`);
+          for (const t of arr) {
+            lines.push(`transfer ${fmtInt(t.amount)} to ${t.to}`);
+          }
+          lines.push("");
+        }
 
-        const first = players[0];
-        const firstInstr = result.sellInstructionsByPlayer.get(first);
-
-        const row = buildInstructionSelect(interaction.channelId, players, first);
-        const content = firstInstr
-          ? renderInstructions(first, firstInstr)
-          : "No instructions available.";
-
-        await interaction.followUp({
-          content,
-          components: [row]
-        });
-
-        sessions.delete(interaction.channelId);
-      } catch (e) {
-        await interaction.editReply(`Settlement failed: ${e.message}`);
+        await interaction.followUp("```text\n" + lines.join("\n") + "\n```");
       }
+
+      instructionBoards.set(interaction.channelId, {
+        createdAtMs: Date.now(),
+        players: result.players,
+        sellInstructionsByPlayer: result.sellInstructionsByPlayer
+      });
+
+      const first = result.players[0];
+      await interaction.followUp({
+        content: renderInstructions(first, result.sellInstructionsByPlayer.get(first)),
+        components: [buildInstructionSelect(interaction.channelId, result.players, first)]
+      });
+
+      sessions.delete(interaction.channelId);
     }
+
   } catch (e) {
-    try {
-      if (interaction.isRepliable()) return interaction.reply({ content: `Error: ${e.message}`, ephemeral: true });
-    } catch {}
     console.error(e);
+    if (interaction.isRepliable()) {
+      try {
+        await interaction.reply({ ephemeral: true, content: `Error: ${e.message}` });
+      } catch {}
+    }
   }
 });
 
-client.once("ready", () => console.log(`Logged in as ${client.user.tag}`));
+/* =======================
+   LOGIN
+======================= */
+
+client.once("ready", () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
 client.login(process.env.DISCORD_TOKEN);
