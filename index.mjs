@@ -13,14 +13,13 @@ import {
   computeCorrectedSettlementSecura
 } from "./settle.mjs";
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// channelId -> settlement session state during collection
+// channelId -> active session
+// session: { party, lootersByName: Map(name->items[]), world }
 const sessions = new Map();
 
-// channelId -> { createdAtMs, players: string[], sellInstructionsByPlayer: Map(name -> instr) }
+// channelId -> { createdAtMs, players: string[], sellInstructionsByPlayer: Map(name->instr) }
 const instructionBoards = new Map();
 const INSTRUCTION_TTL_MS = 30 * 60 * 1000;
 
@@ -28,9 +27,9 @@ function fmtInt(n) {
   return new Intl.NumberFormat("en-US").format(Math.trunc(n));
 }
 
-async function readInputText(interaction) {
-  const text = interaction.options.getString("text", false);
-  const file = interaction.options.getAttachment("file", false);
+async function readInputTextFromTextOrFile(interaction, { textOptName, fileOptName, requireFile = false }) {
+  const text = interaction.options.getString(textOptName, false);
+  const file = interaction.options.getAttachment(fileOptName, false);
 
   if (text && text.trim().length) return text;
 
@@ -40,29 +39,8 @@ async function readInputText(interaction) {
     return await res.text();
   }
 
-  throw new Error("Provide either text OR attach a .txt file.");
-}
-
-function rosterNamesRemaining(sess) {
-  if (!sess?.party?.players?.length) return [];
-  const submitted = new Set([...sess.lootersByName.keys()].map(x => x.toLowerCase()));
-  return sess.party.players
-    .map(p => p.name)
-    .filter(n => !submitted.has(n.toLowerCase()));
-}
-
-function buildLooterSelect(sess) {
-  const remaining = rosterNamesRemaining(sess);
-  const options = remaining.slice(0, 25).map(n => ({ label: n, value: n }));
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId("settle_looter_select")
-      .setPlaceholder(remaining.length ? "Select your character…" : "All looters already submitted")
-      .setMinValues(1)
-      .setMaxValues(1)
-      .addOptions(options.length ? options : [{ label: "No names available", value: "__none__", default: true }])
-      .setDisabled(!options.length)
-  );
+  if (requireFile) throw new Error(`Attach a .txt file in option: ${fileOptName}`);
+  throw new Error("Provide text or attach a .txt file.");
 }
 
 function purgeOldBoards() {
@@ -81,7 +59,7 @@ function buildInstructionSelect(channelId, players, selected = null) {
 
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
-      .setCustomId("settle_instructions_select")
+      .setCustomId("split_instructions_select")
       .setPlaceholder("Pick a player to view sell instructions…")
       .setMinValues(1)
       .setMaxValues(1)
@@ -104,7 +82,7 @@ function renderInstructions(playerName, instr) {
   }
 
   lines.push("");
-  lines.push("SELL TO NPC (best buyer):");
+  lines.push("SELL TO NPC:");
   if (!instr.sellNpc?.length) lines.push("• none");
   else {
     for (const r of instr.sellNpc.slice(0, 35)) {
@@ -126,12 +104,28 @@ function renderInstructions(playerName, instr) {
   return "```text\n" + out + "\n```";
 }
 
+function getSessionOrExplain(channelId) {
+  const sess = sessions.get(channelId);
+  if (!sess) return null;
+  if (!sess.party) return null;
+  return sess;
+}
+
+function partyNames(sess) {
+  return sess?.party?.players?.map(p => p.name) ?? [];
+}
+
+function partyNameCanonical(sess, inputName) {
+  const x = inputName.trim().toLowerCase();
+  return sess.party.players.find(p => p.name.toLowerCase() === x)?.name ?? null;
+}
+
 client.on("interactionCreate", async interaction => {
   try {
     purgeOldBoards();
 
     // Instructions dropdown handler
-    if (interaction.isStringSelectMenu() && interaction.customId === "settle_instructions_select") {
+    if (interaction.isStringSelectMenu() && interaction.customId === "split_instructions_select") {
       const pick = interaction.values?.[0] ?? "";
       const [channelId, playerName] = pick.split("::");
       if (!channelId || !playerName) {
@@ -140,7 +134,7 @@ client.on("interactionCreate", async interaction => {
 
       const board = instructionBoards.get(channelId);
       if (!board) {
-        return interaction.reply({ ephemeral: true, content: "Instruction board expired. Run /settle done again." });
+        return interaction.reply({ ephemeral: true, content: "Instruction board expired. Run /split_done again." });
       }
 
       const instr = board.sellInstructionsByPlayer.get(playerName);
@@ -154,25 +148,34 @@ client.on("interactionCreate", async interaction => {
       return interaction.update({ content, components: [row] });
     }
 
-    // Looter dropdown handler
-    if (interaction.isStringSelectMenu() && interaction.customId === "settle_looter_select") {
-      const sess = sessions.get(interaction.channelId);
-      if (!sess?.party) {
-        return interaction.reply({ ephemeral: true, content: "No active settlement here. Run /settle start." });
+    // Autocomplete for /split_looter name
+    if (interaction.isAutocomplete()) {
+      try {
+        if (interaction.commandName !== "split_looter") return;
+
+        const focused = interaction.options.getFocused(true);
+        if (focused.name !== "name") return;
+
+        const sess = sessions.get(interaction.channelId);
+        if (!sess?.party?.players?.length) {
+          return interaction.respond([{ name: "Run /split_party first", value: "Run /split_party first" }]);
+        }
+
+        const q = String(focused.value || "").toLowerCase().trim();
+
+        // Hide already submitted names (nice UX)
+        const submitted = new Set([...sess.lootersByName.keys()].map(x => x.toLowerCase()));
+        const remaining = sess.party.players.map(p => p.name).filter(n => !submitted.has(n.toLowerCase()));
+
+        const filtered = (q ? remaining.filter(n => n.toLowerCase().includes(q)) : remaining)
+          .slice(0, 25)
+          .map(n => ({ name: n, value: n }));
+
+        return interaction.respond(filtered.length ? filtered : remaining.slice(0, 25).map(n => ({ name: n, value: n })));
+      } catch {
+        try { return interaction.respond([]); } catch {}
       }
-
-      const chosen = interaction.values?.[0];
-      if (!chosen || chosen === "__none__") {
-        return interaction.reply({ ephemeral: true, content: "No character selected." });
-      }
-
-      sess.pendingLooterSelection ??= new Map();
-      sess.pendingLooterSelection.set(interaction.user.id, chosen);
-
-      return interaction.reply({
-        ephemeral: true,
-        content: `Selected **${chosen}**. Now run **/settle looter** and paste your analyzer text (no need to type name).`
-      });
+      return;
     }
 
     if (!interaction.isChatInputCommand()) return;
@@ -198,110 +201,96 @@ client.on("interactionCreate", async interaction => {
       }
     }
 
-    if (interaction.commandName !== "settle") return;
-    const sub = interaction.options.getSubcommand();
-
-    if (sub === "start") {
-      const world = interaction.options.getString("world") ?? "Secura";
+    // /split_party
+    if (interaction.commandName === "split_party") {
+      // create/reset session
       sessions.set(interaction.channelId, {
-        world,
+        world: "Secura",
         party: null,
-        lootersByName: new Map(),
-        pendingLooterSelection: new Map()
+        lootersByName: new Map()
       });
 
-      return interaction.reply({
-        ephemeral: false,
-        content:
-          `Settlement started for **${world}**.\n` +
-          `1) Paste Party Hunt Analyzer with **/settle party**\n` +
-          `2) Players submit looter logs using **/settle looter** (dropdown)\n` +
-          `3) Run **/settle done**`
-      });
-    }
-
-    if (sub === "party") {
       const sess = sessions.get(interaction.channelId);
-      if (!sess) return interaction.reply({ content: "Run **/settle start** first.", ephemeral: true });
 
       try {
-        const partyText = await readInputText(interaction);
-        const party = parsePartyAnalyzerText(partyText);
+        const partyText = await readInputTextFromTextOrFile(interaction, {
+          textOptName: "text",
+          fileOptName: "file",
+          requireFile: false
+        });
 
+        const party = parsePartyAnalyzerText(partyText);
         if (!party.players.length) {
           return interaction.reply({
             ephemeral: true,
-            content: "Could not parse players/supplies from Party Hunt Analyzer. Paste the full party block."
+            content: "Could not parse players/supplies. Paste the full Party Hunt Analyzer block."
           });
         }
 
         sess.party = party;
         sess.lootersByName.clear();
-        sess.pendingLooterSelection.clear();
 
         const names = party.players.map(p => `${p.name} (supplies ${fmtInt(p.supplies)})`).join("\n");
-        return interaction.reply({
-          ephemeral: false,
-          content: `Party loaded. Players: **${party.players.length}**\n` + "```text\n" + names + "\n```"
-        });
-      } catch (e) {
-        return interaction.reply({ content: `Party load failed: ${e.message}`, ephemeral: true });
-      }
-    }
-
-    if (sub === "looter") {
-      const sess = sessions.get(interaction.channelId);
-      if (!sess?.party) {
-        return interaction.reply({ content: "Paste party first using **/settle party**.", ephemeral: true });
-      }
-
-      const typedName = interaction.options.getString("name", false);
-      let rosterName = null;
-
-      if (typedName && typedName.trim().length) {
-        const x = typedName.trim().toLowerCase();
-        rosterName = sess.party.players.find(p => p.name.toLowerCase() === x)?.name ?? null;
-        if (!rosterName) {
-          return interaction.reply({
-            ephemeral: true,
-            content: `Name not in party roster: **${typedName}**. Use dropdown: run /settle looter without name.`
-          });
-        }
-      } else {
-        rosterName = sess.pendingLooterSelection?.get(interaction.user.id) ?? null;
-        if (!rosterName) {
-          const row = buildLooterSelect(sess);
-          return interaction.reply({ ephemeral: true, content: "Pick your character:", components: [row] });
-        }
-      }
-
-      const already = sess.lootersByName.has(rosterName);
-
-      try {
-        const looterText = await readInputText(interaction);
-        const parsed = parseLooterAnalyzerText(looterText);
-        sess.lootersByName.set(rosterName, parsed.items ?? []);
-        sess.pendingLooterSelection?.delete(interaction.user.id);
-
-        const remaining = rosterNamesRemaining(sess);
 
         return interaction.reply({
           ephemeral: false,
           content:
-            `${already ? "Updated" : "Captured"} looter for **${rosterName}**. Items parsed: **${(parsed.items ?? []).length}**\n` +
+            `Party loaded. Players: **${party.players.length}**\n` +
+            `Now each player uses **/split_looter** → pick name → attach file.\n` +
+            `When all are done, run **/split_done**.\n` +
+            "```text\n" + names + "\n```"
+        });
+      } catch (e) {
+        return interaction.reply({ ephemeral: true, content: `Party load failed: ${e.message}` });
+      }
+    }
+
+    // /split_looter
+    if (interaction.commandName === "split_looter") {
+      const sess = getSessionOrExplain(interaction.channelId);
+      if (!sess) {
+        return interaction.reply({ ephemeral: true, content: "No active party here. Run /split_party first." });
+      }
+
+      const chosenName = interaction.options.getString("name", true);
+      const canonical = partyNameCanonical(sess, chosenName);
+      if (!canonical) {
+        return interaction.reply({ ephemeral: true, content: `Name not in party roster: **${chosenName}**` });
+      }
+
+      const already = sess.lootersByName.has(canonical);
+
+      try {
+        const looterText = await readInputTextFromTextOrFile(interaction, {
+          textOptName: "text",
+          fileOptName: "file",
+          requireFile: true
+        });
+
+        const parsed = parseLooterAnalyzerText(looterText);
+        sess.lootersByName.set(canonical, parsed.items ?? []);
+
+        const remaining = partyNames(sess).filter(n => !sess.lootersByName.has(n));
+
+        return interaction.reply({
+          ephemeral: false,
+          content:
+            `${already ? "Updated" : "Captured"} looter for **${canonical}**. ` +
+            `Items parsed: **${(parsed.items ?? []).length}**\n` +
             `Remaining submissions: **${remaining.length}**` +
             (remaining.length ? ` (${remaining.join(", ")})` : "")
         });
       } catch (e) {
-        return interaction.reply({ content: `Looter load failed: ${e.message}`, ephemeral: true });
+        return interaction.reply({ ephemeral: true, content: `Looter load failed: ${e.message}` });
       }
     }
 
-    if (sub === "done") {
+    // /split_done
+    if (interaction.commandName === "split_done") {
       await interaction.deferReply({ ephemeral: false });
 
       const sess = sessions.get(interaction.channelId);
-      if (!sess?.party) return interaction.editReply("Paste party first using **/settle party**.");
+      if (!sess?.party) return interaction.editReply("Paste party first using **/split_party**.");
 
       const missing = sess.party.players.filter(p => !sess.lootersByName.has(p.name)).map(p => p.name);
       if (missing.length) return interaction.editReply(`Missing looter paste for: ${missing.join(", ")}`);
@@ -331,7 +320,7 @@ client.on("interactionCreate", async interaction => {
 
         await interaction.editReply("```text\n" + summary + "\n```");
 
-        // ===== OPTIMIZED TRANSFERS (GROUPED, COPY/PASTE) =====
+        // Grouped transfers copy/paste
         if (!result.transfers.length) {
           await interaction.followUp("```text\nTransfers\nNo transfers needed.\n```");
         } else {
@@ -361,12 +350,10 @@ client.on("interactionCreate", async interaction => {
           }
 
           while (lines.length && lines[lines.length - 1] === "") lines.pop();
-
           await interaction.followUp("```text\n" + lines.join("\n") + "\n```");
         }
-        // ================================================
 
-        // Save instruction board for dropdown rendering
+        // Instruction board
         const players = result.perPlayer.map(p => p.name);
         instructionBoards.set(interaction.channelId, {
           createdAtMs: Date.now(),
@@ -376,13 +363,12 @@ client.on("interactionCreate", async interaction => {
 
         const first = players[0];
         const firstInstr = result.sellInstructionsByPlayer.get(first);
-
         const row = buildInstructionSelect(interaction.channelId, players, first);
-        const content = firstInstr
-          ? renderInstructions(first, firstInstr)
-          : "No instructions available.";
 
-        await interaction.followUp({ content, components: [row] });
+        await interaction.followUp({
+          content: firstInstr ? renderInstructions(first, firstInstr) : "No instructions available.",
+          components: [row]
+        });
 
         sessions.delete(interaction.channelId);
       } catch (e) {
@@ -390,10 +376,12 @@ client.on("interactionCreate", async interaction => {
       }
     }
   } catch (e) {
-    try {
-      if (interaction.isRepliable()) return interaction.reply({ content: `Error: ${e.message}`, ephemeral: true });
-    } catch {}
     console.error(e);
+    try {
+      if (interaction.isRepliable()) {
+        return interaction.reply({ content: `Error: ${e.message}`, ephemeral: true });
+      }
+    } catch {}
   }
 });
 
