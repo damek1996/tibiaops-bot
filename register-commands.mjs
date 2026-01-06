@@ -46,21 +46,32 @@ const commands = [
           { type: 11, name: "file", description: "Attach .txt with analyzer", required: false }
         ]
       },
-      {
-        type: 1,
-        name: "looter",
-        description: "Submit a player's looted items analyzer (use dropdown if no name)",
-        options: [
-          {
-            type: 3,
-            name: "name",
-            description: "Optional exact party name (recommended: leave empty and use dropdown)",
-            required: false
-          },
-          { type: 3, name: "text", description: "Paste analyzer text", required: false },
-          { type: 11, name: "file", description: "Attach .txt with analyzer", required: false }
-        ]
-      },
+ {
+  type: 1,
+  name: "looter",
+  description: "Paste player analyzer (items). If no name, pick from dropdown.",
+  options: [
+    {
+      type: 3,
+      name: "name",
+      description: "Optional: exact character name from party list",
+      required: false
+    },
+    {
+      type: 3,
+      name: "text",
+      description: "Paste analyzer text here",
+      required: false
+    },
+    {
+      type: 11,
+      name: "file",
+      description: "Attach a .txt file with analyzer text",
+      required: false
+    }
+  ]
+},
+
       {
         type: 1,
         name: "done",
